@@ -35,6 +35,111 @@ local function get_api_key(name)
 	return os.getenv(name)
 end
 
+-- I want this test function to get from the lsp all function definitions and print them
+function M.test()
+    local vim = vim  -- Ensure vim is available
+    local lsp_util = require('vim.lsp.util')
+
+local function get_symbols()
+    local params = { textDocument = lsp_util.make_text_document_params() }
+    local result = vim.lsp.buf_request_sync(0, 'textDocument/documentSymbol', params, 1000)
+    if not result or vim.tbl_isempty(result) then
+        print("No symbols found")
+        return
+    end
+
+    local symbols = {}
+    for _, res in pairs(result) do
+        if res.result then
+            for _, symbol in ipairs(res.result) do
+                table.insert(symbols, symbol)
+            end
+        end
+    end
+
+    if #symbols == 0 then
+        print("No symbols found")
+        return
+    end
+
+local symbols = {
+    {
+        selectionRange = { 
+            ["end"] = { character = 62, line = 17 }, 
+            start = { character = 47, line = 17 } 
+        }, 
+        children = {}, 
+        kind = 9, 
+        name = "AuthController", 
+        range = { 
+            ["end"] = { character = 9, line = 29 }, 
+            start = { character = 8, line = 23 } 
+        }, 
+        selectionRange = { 
+            ["end"] = { character = 29, line = 23 }, 
+            start = { character = 15, line = 23 } 
+        } 
+    }, 
+    { 
+        children = {}, 
+        kind = 6, 
+        name = "IsAuthorized", 
+        range = { 
+            ["end"] = { character = 9, line = 40 }, 
+            start = { character = 8, line = 35 } 
+        }, 
+        selectionRange = { 
+            ["end"] = { character = 41, line = 37 }, 
+            start = { character = 29, line = 37 } 
+        } 
+    }, 
+    { 
+        children = {}, 
+        kind = 6, 
+        name = "GetLoggedInUser", 
+        range = { 
+            ["end"] = { character = 9, line = 48 }, 
+            start = { character = 8, line = 42 } 
+        }, 
+        selectionRange = { 
+            ["end"] = { character = 21, line = 43 }, 
+            start = { character = 15, line = 43 } 
+        } 
+    }
+}
+
+print(vim.inspect(symbols))
+
+vim.api.nvim_buf_get_lines(0, 0, -1, false)
+
+for _, symbol in ipairs(symbols) do
+    if symbol.kind == 6 or symbol.kind == 12 then
+        local name = symbol.name
+        local start_line = symbol.range.start.line + 1
+        local start_char = symbol.range.start.character + 1
+        local end_line = symbol.range["end"].line + 1
+        local end_char = symbol.range["end"].character + 1
+        print(string.format("Function: %s at [%d:%d - %d:%d]", name, start_line, start_char, end_line, end_char))
+
+        -- this does not work, cannot index global buffer. How to get the currently used buffer and read its chars at a specific line/position?
+        local buffer = vim.api.nvim_buf_get_lines(0, start_line - 1, end_line, false)
+        for i, buffer_line in ipairs(buffer) do
+            if start_line == end_line then
+                print(buffer_line:sub(start_char, end_char))
+            elseif i == 1 then
+                print(buffer_line:sub(start_char))
+            elseif i == #buffer then
+                print(buffer_line:sub(1, end_char))
+            else
+                print(buffer_line)
+            end
+        end
+    end
+end
+end
+	get_symbols()
+end
+
 function M.setup(opts)
 	timeout_ms = opts.timeout_ms or timeout_ms
 	if opts.services then
