@@ -37,8 +37,38 @@ end
 
 -- I want this test function to get from the lsp all function definitions and print them
 function M.test()
-    local vim = vim  -- Ensure vim is available
-    local lsp_util = require('vim.lsp.util')
+-- Ensure vim and lsp_util are available
+local vim = vim
+local lsp_util = require('vim.lsp.util')
+
+-- Function to print the current type of file and the used lsp
+local function print_filetype_and_lsp()
+    -- Get the current buffer number
+    local bufnr = vim.api.nvim_get_current_buf()
+
+    -- Get the file type of the current buffer
+    local filetype = vim.api.nvim_buf_get_option(bufnr, 'filetype')
+    
+    -- Initialize a variable to hold active LSP clients
+    local active_lsps = {}
+
+    -- Iterate through all attached LSP clients and collect their names
+    for _, client in pairs(vim.lsp.get_active_clients({bufnr = bufnr})) do
+        table.insert(active_lsps, client.name)
+    end
+
+    -- Print the file type
+    print("Filetype: " .. filetype)
+
+    -- Print the active LSP clients or a message if none are found
+    if #active_lsps > 0 then
+        print("Active LSPs: " .. table.concat(active_lsps, ", "))
+    else
+        print("No active LSP clients found.")
+    end
+end
+
+print_filetype_and_lsp()
 
 local function get_symbols()
     local params = { textDocument = vim.lsp.util.make_text_document_params() }
@@ -72,42 +102,49 @@ if #flattened_symbols == 0 then
 end
 
 for _, symbol in ipairs(flattened_symbols) do
-    -- Uncomment the line below to inspect the symbol
-    print(vim.inspect(symbol))
+if symbol.kind == 12 or symbol.kind == 6 then 
+    local name = symbol.name
+    local start_line = symbol.range.start.line + 1
+    local start_char = symbol.range.start.character + 1
 
-    if symbol.kind == 12 or symbol.kind == 6 then 
-        local name = symbol.name
-        local start_line = symbol.range.start.line + 1
-        local start_char = symbol.range.start.character + 1
-        local end_line = symbol.range["end"].line + 1
-        local end_char = symbol.range["end"].character + 1
-
-        -- Get the current buffer
-        local buffer = vim.api.nvim_get_current_buf()
-
-        -- Retrieve the lines for the function
-        local lines = vim.api.nvim_buf_get_lines(buffer, start_line - 1, end_line, false)
-        if #lines == 0 then
-            print("No lines found for the function")
-            return
-        end
-
-        -- Extract the function signature
-        local func_signature = ""
-        if start_line == end_line then
-            -- Function is on a single line
-            func_signature = lines[1]:sub(start_char, end_char)
-        else
-            -- Function spans multiple lines
-            func_signature = lines[1]:sub(start_char)
-            for i = 2, #lines - 1 do
-                func_signature = func_signature .. lines[i]
-            end
-            func_signature = func_signature .. lines[#lines]:sub(1, end_char)
-        end
-
-        print(string.format("Function: %s Signature: %s", name, func_signature))
+    local buffer = vim.api.nvim_get_current_buf()
+    local lines = vim.api.nvim_buf_get_lines(buffer, start_line - 1, start_line, false)
+    if #lines == 0 then
+        print("No lines found for the function")
+        return
     end
+
+local func_signature = ""  
+local buffer = vim.api.nvim_get_current_buf()  
+local lines = vim.api.nvim_buf_get_lines(buffer, start_line - 1, start_line, false)
+local i = 1  
+local signatureFinished = false
+
+while true do
+    local line = lines[1]
+    while i <= #line do
+        local char = line:sub(i, i)
+        if char == '{' then  
+							signatureFinished = true
+            break
+        end
+        func_signature = func_signature .. char
+        i = i + 1
+    end
+
+    if signatureFinished then
+        break
+    end
+
+    start_line = start_line + 1
+    lines = vim.api.nvim_buf_get_lines(buffer, start_line - 1, start_line, false)
+    if #lines == 0 then
+        break
+    end
+    i = 1
+end
+    print(string.format("Function: %s", func_signature))
+end
 end
 end
 	get_symbols()
