@@ -35,42 +35,36 @@ local function get_api_key(name)
 	return os.getenv(name)
 end
 
--- I want this test function to get from the lsp all function definitions and print them
 function M.test()
--- Ensure vim and lsp_util are available
 local vim = vim
 local lsp_util = require('vim.lsp.util')
 
--- Function to print the current type of file and the used lsp
-local function print_filetype_and_lsp()
-    -- Get the current buffer number
-    local bufnr = vim.api.nvim_get_current_buf()
+    local infoTable = {
+        fileInfo = {},
+        codingInfo = { 
+        functions = {},
+        properties = {}
+		}
+    }
 
-    -- Get the file type of the current buffer
-    local filetype = vim.api.nvim_buf_get_option(bufnr, 'filetype')
-    
-    -- Initialize a variable to hold active LSP clients
+local function updateFileInfo(fileInfoTable)
+    local bufnr = vim.api.nvim_get_current_buf()
     local active_lsps = {}
 
-    -- Iterate through all attached LSP clients and collect their names
     for _, client in pairs(vim.lsp.get_active_clients({bufnr = bufnr})) do
         table.insert(active_lsps, client.name)
     end
 
-    -- Print the file type
-    print("Filetype: " .. filetype)
 
-    -- Print the active LSP clients or a message if none are found
     if #active_lsps > 0 then
-        print("Active LSPs: " .. table.concat(active_lsps, ", "))
+	    fileInfoTable.lsp = active_lsps[1]
     else
-        print("No active LSP clients found.")
+	    fileInfoTable.lsp = ''
     end
+    fileInfoTable.fileType =vim.api.nvim_buf_get_option(bufnr, 'filetype') 
 end
 
-print_filetype_and_lsp()
-
-local function get_symbols()
+local function get_symbols(symbols_table)
     local params = { textDocument = vim.lsp.util.make_text_document_params() }
     local result = vim.lsp.buf_request_sync(0, 'textDocument/documentSymbol', params, 1000)
     if not result or vim.tbl_isempty(result) then
@@ -78,76 +72,79 @@ local function get_symbols()
         return
     end
 
-local symbols = {}
-local function flatten_symbols(symbols_table, flattened)
-    for _, symbol in ipairs(symbols_table) do
-        table.insert(flattened, symbol)
-        if symbol.children then
-            flatten_symbols(symbol.children, flattened)
+    local function flatten_symbols(symbols_table, flattened)
+        for _, symbol in ipairs(symbols_table) do
+            table.insert(flattened, symbol)
+            if symbol.children then
+                flatten_symbols(symbol.children, flattened)
+            end
         end
     end
-end
 
--- Flatten the tree structure into a single list of symbols
-local flattened_symbols = {}
-for _, res in pairs(result) do
-    if res.result then
-        flatten_symbols(res.result, flattened_symbols)
+    -- Flatten the tree structure into a single list of symbols
+    local flattened_symbols = {}
+    for _, res in pairs(result) do
+        if res.result then
+            flatten_symbols(res.result, flattened_symbols)
+        end
     end
-end
 
-if #flattened_symbols == 0 then
-    print("No symbols found")
-    return
-end
-
-for _, symbol in ipairs(flattened_symbols) do
-if symbol.kind == 12 or symbol.kind == 6 then 
-    local name = symbol.name
-    local start_line = symbol.range.start.line + 1
-    local start_char = symbol.range.start.character + 1
-
-    local buffer = vim.api.nvim_get_current_buf()
-    local lines = vim.api.nvim_buf_get_lines(buffer, start_line - 1, start_line, false)
-    if #lines == 0 then
-        print("No lines found for the function")
+    if #flattened_symbols == 0 then
+        print("No symbols found")
         return
     end
 
-local func_signature = ""  
-local buffer = vim.api.nvim_get_current_buf()  
-local lines = vim.api.nvim_buf_get_lines(buffer, start_line - 1, start_line, false)
-local i = 1  
-local signatureFinished = false
+    for _, symbol in ipairs(flattened_symbols) do
+            local name = symbol.name
+            local start_line = symbol.range.start.line + 1
+            local start_char = symbol.range.start.character + 1
+            local end_line = symbol.range["end"].line + 1
+            local end_char = symbol.range["end"].character + 1
 
-while true do
-    local line = lines[1]
-    while i <= #line do
-        local char = line:sub(i, i)
-        if char == '{' then  
-							signatureFinished = true
-            break
+            local buffer = vim.api.nvim_get_current_buf()
+            local lines = vim.api.nvim_buf_get_lines(buffer, start_line - 1, start_line, false)
+            if #lines == 0 then
+                print("No lines found for the function or field")
+                return
+            end
+        if symbol.kind == 12 or symbol.kind == 6 then -- Function or Method
+            local func_signature = ""
+            local i = start_char
+            local signatureFinished = false
+            while true do
+                local line = lines[1]
+                while i <= #line do
+                    local char = line:sub(i, i)
+                    if char == '{' then  
+                        signatureFinished = true
+                        break
+                    end
+                    func_signature = func_signature .. char
+                    i = i + 1
+                end
+                if signatureFinished then
+                    break
+                end
+                start_line = start_line + 1
+                lines = vim.api.nvim_buf_get_lines(buffer, start_line - 1, start_line, false)
+                if #lines == 0 then
+                    break
+                end
+                i = 1
+            end
+            table.insert(symbols_table.functions, func_signature)
+
+        elseif symbol.kind == 7 or symbol.kind == 8 then -- Field or Variable
+            local field_content = table.concat(vim.api.nvim_buf_get_lines(buffer, start_line - 1, end_line, false), "\n")
+            table.insert(symbols_table.properties, field_content)
         end
-        func_signature = func_signature .. char
-        i = i + 1
     end
+end
 
-    if signatureFinished then
-        break
-    end
-
-    start_line = start_line + 1
-    lines = vim.api.nvim_buf_get_lines(buffer, start_line - 1, start_line, false)
-    if #lines == 0 then
-        break
-    end
-    i = 1
-end
-    print(string.format("Function: %s", func_signature))
-end
-end
-end
-	get_symbols()
+    updateFileInfo(infoTable.fileInfo)
+    get_symbols(infoTable.codingInfo)
+	print(vim.inspect(infoTable))
+	return infoTable
 end
 
 function M.setup(opts)
@@ -313,6 +310,7 @@ end
 local function prepare_request(opts)
 	local replace = opts.replace
 	local service = opts.service
+	local infoTable = M.test()
 	local visual_lines = M.get_visual_selection()
 	local system_prompt = [[
 You are an AI programming assistant integrated into a code editor. Your purpose is to help the user with programming tasks as they write code.
@@ -331,8 +329,23 @@ Key capabilities:
 	if visual_lines then
 		prompt = table.concat(visual_lines, "\n")
 		if replace then
-			system_prompt =
-			"Follow the instructions in the code comments. Generate code only. Think step by step. If you must speak, do so in comments. Generate valid code only."
+		coding_context = 'The response code is embedded in the following structure. Make sure that the properties and functions are use if necessary for the solution. Use it to avoid duplicated code.'
+		coding_context = coding_context .. 'Functions : ['
+		for _, item in ipairs(infoTable.codingInfo.functions) do
+		  coding_context = coding_context .. ";" .. item
+		end
+		coding_context =coding_context ..  ']'
+		coding_context =coding_context ..  'Properties : ['
+		for _, item in ipairs(infoTable.codingInfo.functions) do
+		  coding_context = coding_context .. ";" .. item
+		end
+		coding_context =coding_context ..  ']'
+
+			file_context = string.format('The file has the file ending: .%s and the used lsp is %s. Make sure the response matches the language used in this file, respond just with code. All meta instructions should be in comments', infoTable.fileInfo.fileType, infoTable.fileInfo.lsp)
+		system_prompt = string.format(
+		"Follow the instructions in the code comments. Generate code only. Think step by step. If you must speak, do so in comments. Generate valid code only. This selection is part of a file in this context: %s. The code to generate is to be seen in this context:  %s.",
+file_context,	 coding_context)
+			print(system_prompt)
 			vim.api.nvim_command("normal! d")
 			vim.api.nvim_command("normal! k")
 		else
@@ -414,23 +427,44 @@ function M.prompt(opts)
 			if err then
 				print("Error:", err)
 			else
-				process_data_lines(buffer, function(data)
-					local content
-					if service == "anthropic" then
-						if data.delta and data.delta.text then
-							content = data.delta.text
-						end
-					else
-						if data.choices and data.choices[1] and data.choices[1].delta then
-							content = data.choices[1].delta.content
-						end
-					end
-					if content and content ~= vim.NIL then
-						has_tokens = true
-						vim.api.nvim_command('undojoin')
-						write_string_at_cursor(content)
-					end
-				end)
+local last_token_was_code_delimiter = false
+
+process_data_lines(buffer, function(data)
+    local content
+local languages = {
+  csharp = true,
+  lua = true,
+  python = true,
+  c = true,
+  rust = true,
+  cpp = true,
+  javascrip = true,
+  typescript = true,
+}
+    if service == "anthropic" then
+        if data.delta and data.delta.text then
+            content = data.delta.text
+        end
+    else
+        if data.choices and data.choices[1] and data.choices[1].delta then
+            content = data.choices[1].delta.content
+        end
+    end
+
+if content and content ~= vim.NIL then
+    if last_token_was_code_delimiter then
+        last_token_was_code_delimiter = false
+elseif languages[content] ~= nil then
+  last_token_was_code_delimiter = true
+    elseif content == '```' or content:sub(1, 3) == '```' then
+        last_token_was_code_delimiter = true
+    else
+            has_tokens = true
+            vim.api.nvim_command('undojoin')
+            write_string_at_cursor(content)
+    end
+end
+end)
 			end
 		end,
 		on_exit = function(j, return_val)
