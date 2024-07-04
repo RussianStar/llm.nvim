@@ -1,6 +1,8 @@
 local M = {}
 
-local vim = vim or {} -- Ensure the `vim` global is available
+M.additionalFiles = {}
+
+local vim = vim or {}
 local curl = require('plenary.curl')
 local telescope = require('telescope')
 local pickers = require('telescope.pickers')
@@ -34,6 +36,8 @@ local service_lookup = {
 local function get_api_key(name)
 	return os.getenv(name)
 end
+
+
 
 function M.test()
 local vim = vim
@@ -341,11 +345,35 @@ Key capabilities:
 		end
 		coding_context =coding_context ..  ']'
 
+
+-- Define the function to read file contents
+local function readFile(filename)
+    local file = io.open(filename, "r") -- Open the file in read mode
+    if not file then return nil end -- If file can't be opened, return nil
+    local content = file:read("*all") -- Read the entire file content
+    file:close() -- Close the file
+    return content -- Return the content
+end
+
+local fileContents = {}
+for _, filename in ipairs(M.additionalFiles) do
+    fileContents[filename] = { content = readFile(filename) }
+end
+
+local contentsString = "Additional Files in the project to assume as existing : [["
+for filename, data in pairs(fileContents) do
+    contentsString = contentsString .. filename .. " : content : " .. data.content .. "\n"
+end
+		contentsString	= contentsString .. "]]"
+
+			-- clear the table to remove all temporary adds
+M.additionalFiles = {}
+
+
 			file_context = string.format('The file has the file ending: .%s and the used lsp is %s. Make sure the response matches the language used in this file, respond just with code. All meta instructions should be in comments', infoTable.fileInfo.fileType, infoTable.fileInfo.lsp)
 		system_prompt = string.format(
-		"Follow the instructions in the code comments. Generate code only. Think step by step. If you must speak, do so in comments. Generate valid code only. This selection is part of a file in this context: %s. The code to generate is to be seen in this context:  %s.",
-file_context,	 coding_context)
-			print(system_prompt)
+		"Follow the instructions in the code comments. Generate code only. Think step by step. If you must speak, do so in comments. Generate valid code only. This selection is part of a file in this context: %s. The code to generate is to be seen in this context:  %s. In the project there exist also those files : %s",
+file_context,	 coding_context, contentsString)
 			vim.api.nvim_command("normal! d")
 			vim.api.nvim_command("normal! k")
 		else
@@ -530,5 +558,23 @@ function M.create_llm_md()
 	end
 end
 
-return M
+function M.open_telescope_and_insert()
+  require('telescope.builtin').find_files({
+    attach_mappings = function(_, map)
+      map('i', '<CR>', function(prompt_bufnr)
+        local action_state = require('telescope.actions.state')
+        local actions = require('telescope.actions')
+        
+        local selection = action_state.get_selected_entry()
+        local file_string = selection.path or selection[1]
 
+        actions.close(prompt_bufnr)
+        print('Added file to next prompt' .. file_string)
+        table.insert(M.additionalFiles, file_string)
+      end)
+      return true
+    end
+  })
+end
+
+return M
