@@ -3,6 +3,28 @@ local M = {}
 
 local timeout_ms = 10000
 
+-- Track the current streaming process so it can be cancelled
+local current_response
+
+-- Remove unwanted characters from streamed content
+local function sanitize_content(content)
+        -- Strip various unicode multiplication symbols and similar characters
+        return content:gsub("[×✕✖✗✘]", "")
+end
+
+-- Display messages when hitting provider limits
+local function check_limits(data, service)
+        if service == "anthropic" then
+                if data.stop_reason == "max_tokens" then
+                        print("llm.nvim: token limit reached")
+                end
+        else
+                if data.choices and data.choices[1] and data.choices[1].finish_reason == "length" then
+                        print("llm.nvim: token limit reached")
+                end
+        end
+end
+
 local service_lookup = {
 	groq = {
 		url = "https://api.groq.com/openai/v1/chat/completions",
@@ -59,56 +81,71 @@ local function write_string_at_cursor(str)
 end
 
 local function process_data_lines(lines, service, process_data)
-	for _, line in ipairs(lines) do
-		local data_start = line:find("data: ")
-		if data_start then
-			local json_str = line:sub(data_start + 6)
-			local stop = false
-			if line == "data: [DONE]" then
-				return true
-			end
-			local data = vim.json.decode(json_str)
-			if service == "anthropic" then
-				stop = data.type == "message_stop"
-			end
-			if stop then
-				return true
-			else
-				nio.sleep(5)
-				vim.schedule(function()
-					vim.cmd("undojoin")
-					process_data(data)
-				end)
-			end
-		end
-	end
-	return false
+        for _, line in ipairs(lines) do
+                local data_start = line:find("data: ")
+                if data_start then
+                        local json_str = line:sub(data_start + 6)
+                        local stop = false
+                        if line == "data: [DONE]" then
+                                return true
+                        end
+                        local ok, data = pcall(vim.json.decode, json_str)
+                        if not ok then
+                                print("llm.nvim: failed to parse response")
+                                return true
+                        end
+                        if data.error then
+                                print("llm.nvim error: " .. (data.error.message or vim.inspect(data.error)))
+                                return true
+                        end
+                        if service == "anthropic" then
+                                stop = data.type == "message_stop"
+                        end
+                        if stop then
+                                check_limits(data, service)
+                                return true
+                        else
+                                nio.sleep(5)
+                                vim.schedule(function()
+                                        vim.cmd("undojoin")
+                                        process_data(data)
+                                end)
+                        end
+                end
+        end
+        return false
 end
 
 local function process_sse_response(response, service)
-	local buffer = ""
-	local has_tokens = false
-	local start_time = vim.uv.hrtime()
+        local buffer = ""
+        local has_tokens = false
+        local start_time = vim.uv.hrtime()
+        current_response = response
 
-	nio.run(function()
-		nio.sleep(timeout_ms)
-		if not has_tokens then
-			response.stdout.close()
-			print("llm.nvim has timed out!")
-		end
-	end)
-	local done = false
-	while not done do
-		local current_time = vim.uv.hrtime()
-		local elapsed = (current_time - start_time)
-		if elapsed >= timeout_ms * 1000000 and not has_tokens then
-			return
-		end
-		local chunk = response.stdout.read(1024)
-		if chunk == nil then
-			break
-		end
-		buffer = buffer .. chunk
+        nio.run(function()
+                nio.sleep(timeout_ms)
+                if current_response == response and not has_tokens then
+                        response.stdout.close()
+                        print("llm.nvim has timed out!")
+                end
+        end)
+        local done = false
+        while not done do
+                local current_time = vim.uv.hrtime()
+                local elapsed = (current_time - start_time)
+                if elapsed >= timeout_ms * 1000000 and not has_tokens then
+                        return
+                end
+                local chunk = response.stdout.read(1024)
+                local err_chunk = response.stderr.read(1024)
+                if err_chunk and #err_chunk > 0 then
+                        print("llm.nvim error: " .. err_chunk)
+                        break
+                end
+                if chunk == nil then
+                        break
+                end
+                buffer = buffer .. chunk
 
 		local lines = {}
 		for line in buffer:gmatch("(.-)\r?\n") do
@@ -128,12 +165,14 @@ local function process_sse_response(response, service)
 					content = data.choices[1].delta.content
 				end
 			end
-			if content and content ~= vim.NIL then
-				has_tokens = true
-				write_string_at_cursor(content)
-			end
-		end)
-	end
+                        if content and content ~= vim.NIL then
+                                content = sanitize_content(content)
+                                has_tokens = true
+                                write_string_at_cursor(content)
+                        end
+                end)
+        end
+        current_response = nil
 end
 
 function M.prompt(opts)
@@ -238,16 +277,29 @@ Key capabilities:
 		end
 	end
 
-	table.insert(args, url)
+        table.insert(args, url)
 
-	local response = nio.process.run({
-		cmd = "curl",
-		args = args,
-	})
-	nio.run(function()
-		nio.api.nvim_command("normal! o")
-		process_sse_response(response, service)
-	end)
+        local response = nio.process.run({
+                cmd = "curl",
+                args = args,
+        })
+        nio.run(function()
+                nio.api.nvim_command("normal! o")
+                process_sse_response(response, service)
+        end)
+end
+
+function M.cancel()
+        if current_response then
+                current_response.stdout.close()
+                if current_response.kill then
+                        current_response:kill()
+                end
+                current_response = nil
+                print("llm.nvim request cancelled")
+        else
+                print("llm.nvim: no active request")
+        end
 end
 
 function M.get_visual_selection()
