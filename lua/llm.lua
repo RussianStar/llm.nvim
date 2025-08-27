@@ -40,117 +40,6 @@ end
 
 
 
-function M.test()
-local vim = vim
-local lsp_util = require('vim.lsp.util')
-
-    local infoTable = {
-        fileInfo = {},
-        codingInfo = { 
-        functions = {},
-        properties = {}
-		}
-    }
-
-local function updateFileInfo(fileInfoTable)
-    local bufnr = vim.api.nvim_get_current_buf()
-    local active_lsps = {}
-
-    for _, client in pairs(vim.lsp.get_active_clients({bufnr = bufnr})) do
-        table.insert(active_lsps, client.name)
-    end
-
-
-    if #active_lsps > 0 then
-	    fileInfoTable.lsp = active_lsps[1]
-    else
-	    fileInfoTable.lsp = ''
-    end
-    fileInfoTable.fileType =vim.api.nvim_buf_get_option(bufnr, 'filetype') 
-end
-
-local function get_symbols(symbols_table)
-    local params = { textDocument = vim.lsp.util.make_text_document_params() }
-    local result = vim.lsp.buf_request_sync(0, 'textDocument/documentSymbol', params, 1000)
-    if not result or vim.tbl_isempty(result) then
-        print("No symbols found")
-        return
-    end
-
-    local function flatten_symbols(symbols_table, flattened)
-        for _, symbol in ipairs(symbols_table) do
-            table.insert(flattened, symbol)
-            if symbol.children then
-                flatten_symbols(symbol.children, flattened)
-            end
-        end
-    end
-
-    -- Flatten the tree structure into a single list of symbols
-    local flattened_symbols = {}
-    for _, res in pairs(result) do
-        if res.result then
-            flatten_symbols(res.result, flattened_symbols)
-        end
-    end
-
-    if #flattened_symbols == 0 then
-        print("No symbols found")
-        return
-    end
-
-    for _, symbol in ipairs(flattened_symbols) do
-            local name = symbol.name
-            local start_line = symbol.range.start.line + 1
-            local start_char = symbol.range.start.character + 1
-            local end_line = symbol.range["end"].line + 1
-            local end_char = symbol.range["end"].character + 1
-
-            local buffer = vim.api.nvim_get_current_buf()
-            local lines = vim.api.nvim_buf_get_lines(buffer, start_line - 1, start_line, false)
-            if #lines == 0 then
-                print("No lines found for the function or field")
-                return
-            end
-        if symbol.kind == 12 or symbol.kind == 6 then -- Function or Method
-            local func_signature = ""
-            local i = start_char
-            local signatureFinished = false
-            while true do
-                local line = lines[1]
-                while i <= #line do
-                    local char = line:sub(i, i)
-                    if char == '{' then  
-                        signatureFinished = true
-                        break
-                    end
-                    func_signature = func_signature .. char
-                    i = i + 1
-                end
-                if signatureFinished then
-                    break
-                end
-                start_line = start_line + 1
-                lines = vim.api.nvim_buf_get_lines(buffer, start_line - 1, start_line, false)
-                if #lines == 0 then
-                    break
-                end
-                i = 1
-            end
-            table.insert(symbols_table.functions, func_signature)
-
-        elseif symbol.kind == 7 or symbol.kind == 8 then -- Field or Variable
-            local field_content = table.concat(vim.api.nvim_buf_get_lines(buffer, start_line - 1, end_line, false), "\n")
-            table.insert(symbols_table.properties, field_content)
-        end
-    end
-end
-
-    updateFileInfo(infoTable.fileInfo)
-    get_symbols(infoTable.codingInfo)
-	print(vim.inspect(infoTable))
-	return infoTable
-end
 
 function M.setup(opts)
 	timeout_ms = opts.timeout_ms or timeout_ms
@@ -324,10 +213,9 @@ end
 
 
 local function prepare_request(opts)
-	local replace = opts.replace
-	local service = opts.service
-	local infoTable = M.test()
-	local visual_lines = M.get_visual_selection()
+        local replace = opts.replace
+        local service = opts.service
+        local visual_lines = M.get_visual_selection()
 	local system_prompt = [[
 You are an AI programming assistant integrated into a code editor. Your purpose is to help the user with programming tasks as they write code.
 Key capabilities:
@@ -344,19 +232,7 @@ Key capabilities:
 
 	if visual_lines then
 		prompt = table.concat(visual_lines, "\n")
-		if replace then
-		coding_context = 'The response code is embedded in the following structure. Make sure that the properties and functions are use if necessary for the solution. Use it to avoid duplicated code.'
-		coding_context = coding_context .. 'Functions : ['
-		for _, item in ipairs(infoTable.codingInfo.functions) do
-		  coding_context = coding_context .. ";" .. item
-		end
-		coding_context =coding_context ..  ']'
-		coding_context =coding_context ..  'Properties : ['
-		for _, item in ipairs(infoTable.codingInfo.functions) do
-		  coding_context = coding_context .. ";" .. item
-		end
-		coding_context =coding_context ..  ']'
-
+                if replace then
 
 -- Define the function to read file contents
 local function readFile(filename)
@@ -376,16 +252,12 @@ local contentsString = "Additional Files in the project to assume as existing : 
 for filename, data in pairs(fileContents) do
     contentsString = contentsString .. filename .. " : content : " .. data.content .. "\n"
 end
-		contentsString	= contentsString .. "]]"
+                contentsString  = contentsString .. "]]"
 
-			-- clear the table to remove all temporary adds
+                        -- clear the table to remove all temporary adds
 M.additionalFiles = {}
 
-
-			file_context = string.format('The file has the file ending: .%s and the used lsp is %s. Make sure the response matches the language used in this file, respond just with code. All meta instructions should be in comments', infoTable.fileInfo.fileType, infoTable.fileInfo.lsp)
-		system_prompt = string.format(
-		"Follow the instructions in the code comments. Generate code only. Think step by step. If you must speak, do so in comments. Generate valid code only. This selection is part of a file in this context: %s. The code to generate is to be seen in this context:  %s. In the project there exist also those files : %s",
-file_context,	 coding_context, contentsString)
+                        system_prompt = system_prompt .. string.format(" In the project there exist also those files : %s", contentsString)
 			vim.api.nvim_command("normal! d")
 			vim.api.nvim_command("normal! k")
 		else
