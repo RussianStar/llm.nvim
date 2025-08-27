@@ -87,6 +87,13 @@ require('llm').edit({
 
 Creates a new `llm.md` file in the current working directory, where you can write questions or prompts for the LLM.
 
+**`token_count()`**
+
+Prints a token count for all files tracked in the current git repository. If the
+[`tiktoken`](https://github.com/openai/tiktoken) Python package is installed,
+it is used for an exact count; otherwise an estimate of one token per four
+characters is used. You can also call this via `:LLMTokenCount`.
+
 **Example Bindings**
 ```lua
 vim.keymap.set("n", "<leader>m", function() require("llm").create_llm_md() end)
