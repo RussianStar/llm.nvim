@@ -15,8 +15,7 @@ lazy.nvim
 {
     "melbaldove/llm.nvim",
     dependencies = {
-        "nvim-neotest/nvim-nio" ,
-		"nvim-telescope/telescope.nvim"
+                "nvim-telescope/telescope.nvim"
         }
 }
 ```
