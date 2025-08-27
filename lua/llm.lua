@@ -1,6 +1,7 @@
 local M = {}
 
 M.additionalFiles = {}
+M.active_jobs = {}
 
 local vim = vim or {}
 local curl = require('plenary.curl')
@@ -250,17 +251,21 @@ function M.get_lines_until_cursor()
 	return table.concat(lines, "\n")
 end
 
-local function write_string_at_cursor(str)
-	local current_window = vim.api.nvim_get_current_win()
-	local cursor_position = vim.api.nvim_win_get_cursor(current_window)
-	local row, col = cursor_position[1], cursor_position[2]
 
-	local lines = vim.split(str, "\n")
-	vim.api.nvim_put(lines, "c", true, true)
-
-	local num_lines = #lines
-	local last_line_length = #lines[num_lines]
-	vim.api.nvim_win_set_cursor(current_window, { row + num_lines - 1, col + last_line_length })
+local function create_buffer_writer(bufnr, row, col)
+        local cur_row, cur_col = row, col
+        return function(str)
+                vim.schedule(function()
+                        local lines = vim.split(str, "\n", { plain = true })
+                        vim.api.nvim_buf_set_text(bufnr, cur_row - 1, cur_col, cur_row - 1, cur_col, lines)
+                        if #lines == 1 then
+                                cur_col = cur_col + #lines[1]
+                        else
+                                cur_row = cur_row + #lines - 1
+                                cur_col = #lines[#lines]
+                        end
+                end)
+        end
 end
 
 local function process_data_lines(buffer, process_data)
@@ -441,66 +446,84 @@ file_context,	 coding_context, contentsString)
 end
 
 function M.prompt(opts)
-	local args = prepare_request(opts)
-	if not args then
-		print("Failed to prepare request.")
-		return
-	end
-	vim.api.nvim_command("normal! o")
-	vim.api.nvim_command('undojoin')
-	Job:new({
-		command = 'curl',
-		args = args,
-		on_stdout = function(err, buffer)
-			if err then
-				print("Error:", err)
-			else
-local last_token_was_code_delimiter = false
-
-process_data_lines(buffer, function(data)
-    local content
-local languages = {
-  csharp = true,
-  lua = true,
-  python = true,
-  c = true,
-  rust = true,
-  cpp = true,
-  javascrip = true,
-  typescript = true,
-}
-    if service == "anthropic" then
-        if data.delta and data.delta.text then
-            content = data.delta.text
+        local service = opts.service
+        local args = prepare_request(opts)
+        if not args then
+                print("Failed to prepare request.")
+                return
         end
-    else
-        if data.choices and data.choices[1] and data.choices[1].delta then
-            content = data.choices[1].delta.content
-        end
-    end
 
-if content and content ~= vim.NIL then
-    if last_token_was_code_delimiter then
-        last_token_was_code_delimiter = false
-elseif languages[content] ~= nil then
-  last_token_was_code_delimiter = true
-    elseif content == '```' or content:sub(1, 3) == '```' then
-        last_token_was_code_delimiter = true
-    else
-            has_tokens = true
-            vim.api.nvim_command('undojoin')
-            write_string_at_cursor(content)
-    end
-end
-end)
-			end
-		end,
-		on_exit = function(j, return_val)
-			if return_val ~= 0 then
-				print("Curl command failed with code:", return_val)
-			end
-		end,
-	}):start()
+        local bufnr = vim.api.nvim_get_current_buf()
+        local pos = vim.api.nvim_win_get_cursor(0)
+        local row, col = pos[1], pos[2]
+        if not opts.replace then
+                vim.api.nvim_buf_set_lines(bufnr, row, row, true, { "" })
+                row = row + 1
+                col = 0
+        end
+
+        local write_to_buffer = create_buffer_writer(bufnr, row, col)
+
+        local job
+        job = Job:new({
+                command = 'curl',
+                args = args,
+                on_stdout = function(err, buffer)
+                        if err then
+                                print("Error:", err)
+                        else
+                                local last_token_was_code_delimiter = false
+
+                                process_data_lines(buffer, function(data)
+                                        local content
+                                        local languages = {
+                                                csharp = true,
+                                                lua = true,
+                                                python = true,
+                                                c = true,
+                                                rust = true,
+                                                cpp = true,
+                                                javascrip = true,
+                                                typescript = true,
+                                        }
+                                        if service == "anthropic" then
+                                                if data.delta and data.delta.text then
+                                                        content = data.delta.text
+                                                end
+                                        else
+                                                if data.choices and data.choices[1] and data.choices[1].delta then
+                                                        content = data.choices[1].delta.content
+                                                end
+                                        end
+
+                                        if content and content ~= vim.NIL then
+                                                if last_token_was_code_delimiter then
+                                                        last_token_was_code_delimiter = false
+                                                elseif languages[content] ~= nil then
+                                                        last_token_was_code_delimiter = true
+                                                elseif content == '```' or content:sub(1, 3) == '```' then
+                                                        last_token_was_code_delimiter = true
+                                                else
+                                                        write_to_buffer(content)
+                                                end
+                                        end
+                                end)
+                        end
+                end,
+                on_exit = function(j, return_val)
+                        for i, active in ipairs(M.active_jobs) do
+                                if active == job then
+                                        table.remove(M.active_jobs, i)
+                                        break
+                                end
+                        end
+                        if return_val ~= 0 then
+                                print("Curl command failed with code:", return_val)
+                        end
+                end,
+        })
+        table.insert(M.active_jobs, job)
+        job:start()
 end
 
 function M.get_visual_selection()
@@ -575,6 +598,13 @@ function M.open_telescope_and_insert()
       return true
     end
   })
+end
+
+function M.cancel_all()
+        for _, job in ipairs(M.active_jobs) do
+                job:shutdown()
+        end
+        M.active_jobs = {}
 end
 
 return M
