@@ -474,8 +474,64 @@ function M.get_visual_selection()
 			)
 		end
 		return lines
-	end
+        end
 end
+
+local function estimate_tokens(text)
+        return math.ceil(#text / 4)
+end
+
+local function has_tiktoken()
+        if vim.fn.executable("python3") ~= 1 then
+                return false
+        end
+        vim.fn.system({ "python3", "-c", "import tiktoken" })
+        return vim.v.shell_error == 0
+end
+
+local function count_file_tokens(path, use_tiktoken)
+        if use_tiktoken then
+                local py = "import sys, tiktoken, codecs; text = codecs.open(sys.argv[1], 'r', encoding='utf-8', errors='ignore').read(); enc = tiktoken.get_encoding('cl100k_base'); print(len(enc.encode(text)))"
+                local out = vim.fn.system({ "python3", "-c", py, path })
+                if vim.v.shell_error == 0 then
+                        local n = tonumber(out)
+                        if n then
+                                return n
+                        end
+                end
+        end
+
+        local ok, lines = pcall(vim.fn.readfile, path)
+        if ok then
+                return estimate_tokens(table.concat(lines, "\n"))
+        end
+        return 0
+end
+
+function M.token_count()
+        local root = vim.fn.systemlist("git rev-parse --show-toplevel")[1]
+        if vim.v.shell_error ~= 0 or not root or root == "" then
+                print("llm.nvim: not a git repository")
+                return 0
+        end
+
+        local cmd = string.format("git -C %s ls-files", vim.fn.shellescape(root))
+        local files = vim.fn.systemlist(cmd)
+
+        local use_tiktoken = has_tiktoken()
+        local total = 0
+        for _, file in ipairs(files) do
+                total = total + count_file_tokens(root .. "/" .. file, use_tiktoken)
+        end
+
+        local msg = use_tiktoken and "token count" or "estimated token count"
+        print("llm.nvim: " .. msg .. " " .. total)
+        return total
+end
+
+vim.api.nvim_create_user_command("LLMTokenCount", function()
+        M.token_count()
+end, {})
 
 function M.create_llm_md()
 	local cwd = vim.fn.getcwd()
