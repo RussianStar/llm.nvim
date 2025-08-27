@@ -1,4 +1,5 @@
 local nio = require("nio")
+local diff = require("llm.diff")
 local M = {}
 
 local timeout_ms = 10000
@@ -287,6 +288,139 @@ Key capabilities:
                 nio.api.nvim_command("normal! o")
                 process_sse_response(response, service)
         end)
+end
+
+function M.edit(opts)
+        opts = opts or {}
+        local files = opts.files or { vim.api.nvim_buf_get_name(0) }
+        local service = opts.service
+        local instruction = opts.prompt or ""
+
+        local service_info = service_lookup[service]
+        if not service_info then
+                print("Invalid service: " .. tostring(service))
+                return false, "invalid service"
+        end
+
+        local rel_files, context_str
+        if opts.context then
+                context_str = opts.context
+                rel_files = {}
+                for _, file in ipairs(files) do
+                        table.insert(rel_files, vim.fn.fnamemodify(file, ":."))
+                end
+        else
+                local contexts = {}
+                rel_files = {}
+                for _, file in ipairs(files) do
+                        local rel = vim.fn.fnamemodify(file, ":.")
+                        table.insert(rel_files, rel)
+                        local lines = vim.fn.readfile(file)
+                        table.insert(contexts, string.format("file: %s\n```\n%s\n```", rel, table.concat(lines, "\n")))
+                end
+                context_str = table.concat(contexts, "\n\n")
+        end
+        local user_prompt = instruction
+                .. "\n\n"
+                .. context_str
+                .. "\nRespond with unified diffs in blocks like ```diff file=path```"
+        if opts.allow_new_files then
+                user_prompt = user_prompt .. "\nYou may include blocks for new files."
+        end
+
+        local api_key = get_api_key(service_info.api_key_name)
+        local data
+        if service == "anthropic" then
+                data = {
+                        system = "You are an AI code editor that returns patches.",
+                        messages = {
+                                {
+                                        role = "user",
+                                        content = user_prompt,
+                                },
+                        },
+                        model = service_info.model,
+                        max_tokens = 1024,
+                }
+        else
+                data = {
+                        messages = {
+                                {
+                                        role = "system",
+                                        content = "You are an AI code editor that returns patches.",
+                                },
+                                {
+                                        role = "user",
+                                        content = user_prompt,
+                                },
+                        },
+                        model = service_info.model,
+                        temperature = 0,
+                }
+        end
+
+        local args = {
+                "-s",
+                "-X",
+                "POST",
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                vim.json.encode(data),
+        }
+
+        if api_key then
+                if service == "anthropic" then
+                        table.insert(args, "-H")
+                        table.insert(args, "x-api-key: " .. api_key)
+                        table.insert(args, "-H")
+                        table.insert(args, "anthropic-version: 2023-06-01")
+                else
+                        table.insert(args, "-H")
+                        table.insert(args, "Authorization: Bearer " .. api_key)
+                end
+        end
+
+        table.insert(args, service_info.url)
+
+        local result = vim.system({ "curl", unpack(args) }, { text = true }):wait()
+        if result.code ~= 0 then
+                return false, result.stderr
+        end
+
+        local body = result.stdout
+        local ok, parsed = pcall(vim.json.decode, body)
+        if not ok then
+                return false, "invalid json"
+        end
+        if parsed.error then
+                return false, parsed.error.message or parsed.error
+        end
+
+        local response
+        if service == "anthropic" then
+                response = parsed.content and parsed.content[1] and parsed.content[1].text or ""
+        else
+                response =
+                        parsed.choices
+                        and parsed.choices[1]
+                        and parsed.choices[1].message
+                        and parsed.choices[1].message.content
+                        or ""
+        end
+
+        local apply = opts.apply or false
+        local success, err = diff.apply_response(response, {
+                retry = opts.retry,
+                dry_run = not apply,
+                allow_new_files = opts.allow_new_files,
+                files = rel_files,
+        })
+        if not success then
+                print("llm.nvim: " .. err)
+                return false, err
+        end
+        return true
 end
 
 function M.cancel()
