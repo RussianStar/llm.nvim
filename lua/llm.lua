@@ -253,17 +253,24 @@ end
 
 
 local function create_buffer_writer(bufnr, row, col)
-        local cur_row, cur_col = row, col
+        local ns = vim.api.nvim_create_namespace("llm_stream")
+        local mark_id = vim.api.nvim_buf_set_extmark(bufnr, ns, row - 1, col, {})
         return function(str)
                 vim.schedule(function()
                         local lines = vim.split(str, "\n", { plain = true })
-                        vim.api.nvim_buf_set_text(bufnr, cur_row - 1, cur_col, cur_row - 1, cur_col, lines)
-                        if #lines == 1 then
-                                cur_col = cur_col + #lines[1]
-                        else
-                                cur_row = cur_row + #lines - 1
-                                cur_col = #lines[#lines]
+                        local pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, ns, mark_id, {})
+                        if not pos then
+                                return
                         end
+                        local line, start_col = pos[1], pos[2]
+                        vim.api.nvim_buf_set_text(bufnr, line, start_col, line, start_col, lines)
+                        if #lines == 1 then
+                                start_col = start_col + #lines[1]
+                        else
+                                line = line + #lines - 1
+                                start_col = #lines[#lines]
+                        end
+                        mark_id = vim.api.nvim_buf_set_extmark(bufnr, ns, line, start_col, { id = mark_id })
                 end)
         end
 end
