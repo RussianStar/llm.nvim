@@ -60,6 +60,10 @@ require('llm').setup({
 
 Triggers the LLM assistant. You can pass an optional `replace` flag to replace the current selection with the LLM's response. The prompt is either the visually selected text or the file content up to the cursor if no selection is made.
 
+**`cancel()`**
+
+Stops the current request if one is running.
+
 **`create_llm_md()`**
 
 Creates a new `llm.md` file in the current working directory, where you can write questions or prompts for the LLM.
