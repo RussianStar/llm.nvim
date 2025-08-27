@@ -4,8 +4,11 @@ local M = {}
 
 local timeout_ms = 10000
 
--- Track the current streaming process so it can be cancelled
-local current_response
+-- Track streaming processes so they can be cancelled independently
+local current_responses = {}
+
+-- Namespace for extmarks used when streaming results
+local ns = vim.api.nvim_create_namespace("llm")
 
 -- Remove unwanted characters from streamed content
 local function sanitize_content(content)
@@ -68,20 +71,27 @@ function M.get_lines_until_cursor()
 	return table.concat(lines, "\n")
 end
 
-local function write_string_at_cursor(str)
-	local current_window = vim.api.nvim_get_current_win()
-	local cursor_position = vim.api.nvim_win_get_cursor(current_window)
-	local row, col = cursor_position[1], cursor_position[2]
+local function write_at_mark(ctx, str)
+        local buf, mark = ctx.buf, ctx.mark
+        -- Get current position of the extmark
+        local pos = vim.api.nvim_buf_get_extmark_by_id(buf, ns, mark, {})
+        if not pos or #pos == 0 then
+                return
+        end
+        local row, col = pos[1], pos[2]
+        local lines = vim.split(str, "\n")
+        vim.api.nvim_buf_call(buf, function()
+                pcall(vim.cmd, "undojoin")
+                vim.api.nvim_buf_set_text(buf, row, col, row, col, lines)
+        end)
 
-	local lines = vim.split(str, "\n")
-	vim.api.nvim_put(lines, "c", true, true)
-
-	local num_lines = #lines
-	local last_line_length = #lines[num_lines]
-	vim.api.nvim_win_set_cursor(current_window, { row + num_lines - 1, col + last_line_length })
+        local last_line = lines[#lines]
+        local new_row = row + #lines - 1
+        local new_col = #lines == 1 and col + #last_line or #last_line
+        vim.api.nvim_buf_set_extmark(buf, ns, new_row, new_col, { id = mark })
 end
 
-local function process_data_lines(lines, service, process_data)
+local function process_data_lines(lines, service, ctx, process_data)
         for _, line in ipairs(lines) do
                 local data_start = line:find("data: ")
                 if data_start then
@@ -108,8 +118,10 @@ local function process_data_lines(lines, service, process_data)
                         else
                                 nio.sleep(5)
                                 vim.schedule(function()
-                                        vim.cmd("undojoin")
-                                        process_data(data)
+                                        vim.api.nvim_buf_call(ctx.buf, function()
+                                                pcall(vim.cmd, "undojoin")
+                                                process_data(data)
+                                        end)
                                 end)
                         end
                 end
@@ -117,16 +129,21 @@ local function process_data_lines(lines, service, process_data)
         return false
 end
 
-local function process_sse_response(response, service)
+local function process_sse_response(ctx, service)
+        local response = ctx.response
         local buffer = ""
         local has_tokens = false
         local start_time = vim.uv.hrtime()
-        current_response = response
+        current_responses[response] = ctx
 
         nio.run(function()
                 nio.sleep(timeout_ms)
-                if current_response == response and not has_tokens then
+                if current_responses[response] and not has_tokens then
                         response.stdout.close()
+                        if response.kill then
+                                response:kill()
+                        end
+                        current_responses[response] = nil
                         print("llm.nvim has timed out!")
                 end
         end)
@@ -155,12 +172,12 @@ local function process_sse_response(response, service)
 
 		buffer = buffer:sub(#table.concat(lines, "\n") + 1)
 
-		done = process_data_lines(lines, service, function(data)
-			local content
-			if service == "anthropic" then
-				if data.delta and data.delta.text then
-					content = data.delta.text
-				end
+                done = process_data_lines(lines, service, ctx, function(data)
+                        local content
+                        if service == "anthropic" then
+                                if data.delta and data.delta.text then
+                                        content = data.delta.text
+                                end
 			else
 				if data.choices and data.choices[1] and data.choices[1].delta then
 					content = data.choices[1].delta.content
@@ -169,11 +186,11 @@ local function process_sse_response(response, service)
                         if content and content ~= vim.NIL then
                                 content = sanitize_content(content)
                                 has_tokens = true
-                                write_string_at_cursor(content)
+                                write_at_mark(ctx, content)
                         end
                 end)
         end
-        current_response = nil
+        current_responses[response] = nil
 end
 
 function M.prompt(opts)
@@ -280,13 +297,20 @@ Key capabilities:
 
         table.insert(args, url)
 
+        -- capture buffer and position for streaming
+        local buf = vim.api.nvim_get_current_buf()
+        local row = vim.api.nvim_win_get_cursor(0)[1]
+        -- insert a new line where output will be written
+        vim.api.nvim_buf_set_lines(buf, row, row, true, { "" })
+        local mark = vim.api.nvim_buf_set_extmark(buf, ns, row, 0, {})
+
         local response = nio.process.run({
                 cmd = "curl",
                 args = args,
         })
+        local ctx = { buf = buf, mark = mark, response = response }
         nio.run(function()
-                nio.api.nvim_command("normal! o")
-                process_sse_response(response, service)
+                process_sse_response(ctx, service)
         end)
 end
 
@@ -424,12 +448,16 @@ function M.edit(opts)
 end
 
 function M.cancel()
-        if current_response then
-                current_response.stdout.close()
-                if current_response.kill then
-                        current_response:kill()
+        local cancelled = false
+        for _, ctx in pairs(current_responses) do
+                ctx.response.stdout.close()
+                if ctx.response.kill then
+                        ctx.response:kill()
                 end
-                current_response = nil
+                cancelled = true
+        end
+        current_responses = {}
+        if cancelled then
                 print("llm.nvim request cancelled")
         else
                 print("llm.nvim: no active request")
