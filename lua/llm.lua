@@ -4,6 +4,88 @@ local M = {}
 
 local timeout_ms = 10000
 
+local default_openai_adapter = {
+        build_chat_payload = function(args)
+                local data = {
+                        messages = {
+                                {
+                                        role = "system",
+                                        content = args.system_prompt,
+                                },
+                                {
+                                        role = "user",
+                                        content = args.user_prompt,
+                                },
+                        },
+                        model = args.model,
+                        stream = args.stream,
+                        temperature = args.temperature or 0.7,
+                }
+
+                if args.extra_params then
+                        for key, value in pairs(args.extra_params) do
+                                data[key] = value
+                        end
+                end
+
+                return data
+        end,
+        extract_stream_content = function(data, opts)
+                opts = opts or {}
+                local delta = data.choices and data.choices[1] and data.choices[1].delta
+                if not delta then
+                        return nil
+                end
+
+                local content = delta.content
+                if type(content) == "table" then
+                        local chunks = {}
+                        for _, part in ipairs(content) do
+                                if part.type == "reasoning" and opts.trim_thinking then
+                                        goto continue
+                                end
+                                if part.type == "text" and part.text then
+                                        table.insert(chunks, part.text)
+                                end
+                                ::continue::
+                        end
+                        return table.concat(chunks, "")
+                end
+
+                if type(content) == "string" then
+                        if opts.trim_thinking then
+                                return content:gsub("<think>[%s%S]-</think>", "")
+                        end
+                        return content
+                end
+
+                return nil
+        end,
+        extract_message_content = function(message, opts)
+                opts = opts or {}
+                local content = message and message.content
+                if type(content) == "table" then
+                        local parts = {}
+                        for _, item in ipairs(content) do
+                                if item.type == "reasoning" and opts.trim_thinking then
+                                        goto continue
+                                end
+                                if item.type == "text" and item.text then
+                                        table.insert(parts, item.text)
+                                end
+                                ::continue::
+                        end
+                        return table.concat(parts, "")
+                elseif type(content) == "string" then
+                        if opts.trim_thinking then
+                                return content:gsub("<think>[%s%S]-</think>", "")
+                        end
+                        return content
+                end
+                return ""
+        end,
+}
+
 -- Track streaming processes so they can be cancelled independently
 local current_responses = {}
 
@@ -14,6 +96,16 @@ local ns = vim.api.nvim_create_namespace("llm")
 local function sanitize_content(content)
         -- Strip various unicode multiplication symbols and similar characters
         return content:gsub("[×✕✖✗✘]", "")
+end
+
+local function add_custom_headers(args, headers)
+        if not headers then
+                return
+        end
+        for name, value in pairs(headers) do
+                table.insert(args, "-H")
+                table.insert(args, string.format("%s: %s", name, value))
+        end
 end
 
 -- Display messages when hitting provider limits
@@ -29,22 +121,70 @@ local function check_limits(data, service)
         end
 end
 
+local anthropic_adapter = {
+        build_chat_payload = function(args)
+                local data = {
+                        system = args.system_prompt,
+                        messages = {
+                                {
+                                        role = "user",
+                                        content = args.user_prompt,
+                                },
+                        },
+                        model = args.model,
+                        stream = args.stream,
+                        max_tokens = args.max_tokens or 1024,
+                }
+
+                if args.extra_params then
+                        for key, value in pairs(args.extra_params) do
+                                data[key] = value
+                        end
+                end
+
+                return data
+        end,
+        extract_stream_content = function(data)
+                if data.delta and data.delta.text then
+                        return data.delta.text
+                end
+                return nil
+        end,
+        extract_message_content = function(message)
+                local content = message and message[1]
+                if type(content) == "table" and content.text then
+                        return content.text
+                end
+                return ""
+        end,
+}
+
 local service_lookup = {
-	groq = {
-		url = "https://api.groq.com/openai/v1/chat/completions",
-		model = "llama3-70b-8192",
-		api_key_name = "GROQ_API_KEY",
-	},
-	openai = {
-		url = "https://api.openai.com/v1/chat/completions",
-		model = "gpt-4o",
-		api_key_name = "OPENAI_API_KEY",
-	},
-	anthropic = {
-		url = "https://api.anthropic.com/v1/messages",
-		model = "claude-3-5-sonnet-20240620",
-		api_key_name = "ANTHROPIC_API_KEY",
-	},
+        groq = {
+                url = "https://api.groq.com/openai/v1/chat/completions",
+                model = "llama3-70b-8192",
+                api_key_name = "GROQ_API_KEY",
+                adapter = default_openai_adapter,
+        },
+        openai = {
+                url = "https://api.openai.com/v1/chat/completions",
+                model = "gpt-4o",
+                api_key_name = "OPENAI_API_KEY",
+                adapter = default_openai_adapter,
+        },
+        openrouter = {
+                url = "https://openrouter.ai/api/v1/chat/completions",
+                model = "gpt-4o-mini",
+                api_key_name = "OPENROUTER_API_KEY",
+                adapter = default_openai_adapter,
+                trim_thinking = true,
+        },
+        anthropic = {
+                url = "https://api.anthropic.com/v1/messages",
+                model = "claude-3-5-sonnet-20240620",
+                api_key_name = "ANTHROPIC_API_KEY",
+                adapter = anthropic_adapter,
+        },
 }
 
 local function get_api_key(name)
@@ -52,12 +192,15 @@ local function get_api_key(name)
 end
 
 function M.setup(opts)
-	timeout_ms = opts.timeout_ms or timeout_ms
-	if opts.services then
-		for key, service in pairs(opts.services) do
-			service_lookup[key] = service
-		end
-	end
+        timeout_ms = opts.timeout_ms or timeout_ms
+        if opts.services then
+                for key, service in pairs(opts.services) do
+                        if not service.adapter then
+                                service.adapter = default_openai_adapter
+                        end
+                        service_lookup[key] = service
+                end
+        end
 end
 
 function M.get_lines_until_cursor()
@@ -174,16 +317,10 @@ local function process_sse_response(ctx, service)
 
                 done = process_data_lines(lines, service, ctx, function(data)
                         local content
-                        if service == "anthropic" then
-                                if data.delta and data.delta.text then
-                                        content = data.delta.text
-                                end
-			else
-				if data.choices and data.choices[1] and data.choices[1].delta then
-					content = data.choices[1].delta.content
-				end
-			end
-                        if content and content ~= vim.NIL then
+                        if ctx.adapter and ctx.adapter.extract_stream_content then
+                                content = ctx.adapter.extract_stream_content(data, { trim_thinking = ctx.trim_thinking })
+                        end
+                        if content and content ~= vim.NIL and content ~= "" then
                                 content = sanitize_content(content)
                                 has_tokens = true
                                 write_at_mark(ctx, content)
@@ -225,67 +362,59 @@ Key capabilities:
 		prompt = M.get_lines_until_cursor()
 	end
 
-	local url = ""
-	local model = ""
-	local api_key_name = ""
+        local url = ""
+        local model = ""
+        local api_key_name = ""
+        local adapter
+        local trim_thinking = opts.trim_thinking
+        local stream_params
 
-	local found_service = service_lookup[service]
-	if found_service then
-		url = found_service.url
-		api_key_name = found_service.api_key_name
-		model = found_service.model
-	else
-		print("Invalid service: " .. service)
-		return
-	end
+        local found_service = service_lookup[service]
+        if found_service then
+                url = found_service.url
+                api_key_name = found_service.api_key_name
+                model = found_service.model
+                adapter = found_service.adapter
+                stream_params = found_service.stream_params
+                if trim_thinking == nil then
+                        trim_thinking = found_service.trim_thinking
+                end
+        else
+                print("Invalid service: " .. service)
+                return
+        end
 
-	local api_key = api_key_name and get_api_key(api_key_name)
+        adapter = adapter or default_openai_adapter
+        trim_thinking = trim_thinking or false
 
-	local data
-	if service == "anthropic" then
-		data = {
-			system = system_prompt,
-			messages = {
-				{
-					role = "user",
-					content = prompt,
-				},
-			},
-			model = model,
-			stream = true,
-			max_tokens = 1024,
-		}
-	else
-		data = {
-			messages = {
-				{
-					role = "system",
-					content = system_prompt,
-				},
-				{
-					role = "user",
-					content = prompt,
-				},
-			},
-			model = model,
-			temperature = 0.7,
-			stream = true,
-		}
-	end
+        local api_key = api_key_name and get_api_key(api_key_name)
 
-	local args = {
-		"-N",
-		"-X",
-		"POST",
-		"-H",
-		"Content-Type: application/json",
-		"-d",
-		vim.json.encode(data),
-	}
+        local data
+        data = adapter.build_chat_payload({
+                system_prompt = system_prompt,
+                user_prompt = prompt,
+                model = model,
+                stream = true,
+                temperature = 0.7,
+                max_tokens = 1024,
+                extra_params = stream_params,
+        })
 
-	if api_key then
-		if service == "anthropic" then
-			table.insert(args, "-H")
+        local args = {
+                "-N",
+                "-X",
+                "POST",
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                vim.json.encode(data),
+        }
+
+        add_custom_headers(args, found_service.headers)
+
+        if api_key then
+                if service == "anthropic" then
+                        table.insert(args, "-H")
 			table.insert(args, "x-api-key: " .. api_key)
 			table.insert(args, "-H")
 			table.insert(args, "anthropic-version: 2023-06-01")
@@ -308,7 +437,7 @@ Key capabilities:
                 cmd = "curl",
                 args = args,
         })
-        local ctx = { buf = buf, mark = mark, response = response }
+        local ctx = { buf = buf, mark = mark, response = response, adapter = adapter, trim_thinking = trim_thinking }
         nio.run(function()
                 process_sse_response(ctx, service)
         end)
@@ -353,35 +482,22 @@ function M.edit(opts)
         end
 
         local api_key = get_api_key(service_info.api_key_name)
-        local data
-        if service == "anthropic" then
-                data = {
-                        system = "You are an AI code editor that returns patches.",
-                        messages = {
-                                {
-                                        role = "user",
-                                        content = user_prompt,
-                                },
-                        },
-                        model = service_info.model,
-                        max_tokens = 1024,
-                }
-        else
-                data = {
-                        messages = {
-                                {
-                                        role = "system",
-                                        content = "You are an AI code editor that returns patches.",
-                                },
-                                {
-                                        role = "user",
-                                        content = user_prompt,
-                                },
-                        },
-                        model = service_info.model,
-                        temperature = 0,
-                }
+        local adapter = service_info.adapter or default_openai_adapter
+        local trim_thinking = opts.trim_thinking
+        if trim_thinking == nil then
+                trim_thinking = service_info.trim_thinking
         end
+        trim_thinking = trim_thinking or false
+
+        local data = adapter.build_chat_payload({
+                system_prompt = "You are an AI code editor that returns patches.",
+                user_prompt = user_prompt,
+                model = service_info.model,
+                stream = false,
+                temperature = 0,
+                max_tokens = service_info.max_tokens or 1024,
+                extra_params = service_info.edit_params,
+        })
 
         local args = {
                 "-s",
@@ -392,6 +508,8 @@ function M.edit(opts)
                 "-d",
                 vim.json.encode(data),
         }
+
+        add_custom_headers(args, service_info.headers)
 
         if api_key then
                 if service == "anthropic" then
@@ -423,14 +541,12 @@ function M.edit(opts)
 
         local response
         if service == "anthropic" then
-                response = parsed.content and parsed.content[1] and parsed.content[1].text or ""
+                response = adapter.extract_message_content(parsed.content, { trim_thinking = trim_thinking })
         else
-                response =
-                        parsed.choices
-                        and parsed.choices[1]
-                        and parsed.choices[1].message
-                        and parsed.choices[1].message.content
-                        or ""
+                response = adapter.extract_message_content(
+                        parsed.choices and parsed.choices[1] and parsed.choices[1].message,
+                        { trim_thinking = trim_thinking }
+                )
         end
 
         local apply = opts.apply or false
