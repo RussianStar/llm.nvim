@@ -188,7 +188,17 @@ local service_lookup = {
 }
 
 local function get_api_key(name)
-	return os.getenv(name)
+        return os.getenv(name)
+end
+
+local function get_service(name)
+        local service = service_lookup[name]
+        if not service then
+                print("llm.nvim: unknown service '" .. name .. "'")
+                return nil
+        end
+
+        return service
 end
 
 function M.setup(opts)
@@ -201,6 +211,117 @@ function M.setup(opts)
                         service_lookup[key] = service
                 end
         end
+end
+
+local function fetch_openrouter_models()
+        local service = get_service("openrouter")
+        if not service then
+                return nil
+        end
+
+        local api_key_name = service.api_key_name or "OPENROUTER_API_KEY"
+        local api_key = get_api_key(api_key_name)
+        if not api_key then
+                print("llm.nvim: missing env var '" .. api_key_name .. "' for OpenRouter")
+                return nil
+        end
+
+        local args = {
+                "-sS",
+                "-H",
+                "Authorization: Bearer " .. api_key,
+        }
+
+        add_custom_headers(args, service.headers)
+
+        table.insert(args, "https://openrouter.ai/api/v1/models")
+
+        local result = vim.system({ "curl", unpack(args) }, { text = true }):wait()
+        if result.code ~= 0 then
+                print("llm.nvim: failed to fetch models from OpenRouter")
+                return nil
+        end
+
+        local ok, data = pcall(vim.json.decode, result.stdout)
+        if not ok or not data or not data.data then
+                print("llm.nvim: unable to parse OpenRouter models list")
+                return nil
+        end
+
+        return data.data
+end
+
+local function pick_openrouter_model()
+        local ok = pcall(require, "telescope")
+        if not ok then
+                print("llm.nvim: telescope.nvim is required for model selection")
+                return
+        end
+
+        local models = fetch_openrouter_models()
+        if not models or vim.tbl_isempty(models) then
+                return
+        end
+
+        local pickers = require("telescope.pickers")
+        local finders = require("telescope.finders")
+        local conf = require("telescope.config").values
+        local actions = require("telescope.actions")
+        local action_state = require("telescope.actions.state")
+
+        local entries = {}
+        for _, item in ipairs(models) do
+                local id = item.id or item.name
+                if id then
+                        table.insert(entries, {
+                                value = id,
+                                display = item.name and string.format("%s - %s", id, item.name) or id,
+                                ordinal = string.format("%s %s", id, item.name or ""),
+                        })
+                end
+        end
+
+        if vim.tbl_isempty(entries) then
+                print("llm.nvim: no models returned by OpenRouter")
+                return
+        end
+
+        pickers
+                .new({}, {
+                        prompt_title = "OpenRouter Models",
+                        finder = finders.new_table({
+                                results = entries,
+                                entry_maker = function(entry)
+                                        return {
+                                                value = entry.value,
+                                                display = entry.display,
+                                                ordinal = entry.ordinal,
+                                        }
+                                end,
+                        }),
+                        sorter = conf.generic_sorter({}),
+                        attach_mappings = function(prompt_bufnr, map)
+                                local function set_model()
+                                        local selection = action_state.get_selected_entry()
+                                        actions.close(prompt_bufnr)
+                                        if not selection or not selection.value then
+                                                return
+                                        end
+
+                                        local service = get_service("openrouter")
+                                        if not service then
+                                                return
+                                        end
+
+                                        service.model = selection.value
+                                        print("llm.nvim: OpenRouter model set to " .. selection.value)
+                                end
+
+                                actions.select_default:replace(set_model)
+                                return true
+                        end,
+                })
+                :find()
 end
 
 function M.get_lines_until_cursor()
@@ -678,16 +799,18 @@ vim.api.nvim_create_user_command("LLMTokenCount", function()
 end, {})
 
 function M.create_llm_md()
-	local cwd = vim.fn.getcwd()
-	local cur_buf = vim.api.nvim_get_current_buf()
-	local cur_buf_name = vim.api.nvim_buf_get_name(cur_buf)
-	local llm_md_path = cwd .. "/llm.md"
-	if cur_buf_name ~= llm_md_path then
-		vim.api.nvim_command("edit " .. llm_md_path)
-		local buf = vim.api.nvim_get_current_buf()
-		vim.api.nvim_buf_set_option(buf, "filetype", "markdown")
-		vim.api.nvim_win_set_buf(0, buf)
-	end
+        local cwd = vim.fn.getcwd()
+        local cur_buf = vim.api.nvim_get_current_buf()
+        local cur_buf_name = vim.api.nvim_buf_get_name(cur_buf)
+        local llm_md_path = cwd .. "/llm.md"
+        if cur_buf_name ~= llm_md_path then
+                vim.api.nvim_command("edit " .. llm_md_path)
+                local buf = vim.api.nvim_get_current_buf()
+                vim.api.nvim_buf_set_option(buf, "filetype", "markdown")
+                vim.api.nvim_win_set_buf(0, buf)
+        end
 end
+
+M.pick_openrouter_model = pick_openrouter_model
 
 return M

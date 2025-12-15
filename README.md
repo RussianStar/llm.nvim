@@ -56,6 +56,34 @@ require('llm').setup({
 })
 ```
 
+**Example OpenRouter Configuration**
+
+```lua
+require('llm').setup({
+    timeout_ms = 14000,
+    services = {
+        openrouter = {
+            url = "https://openrouter.ai/api/v1/chat/completions",
+            model = "anthropic/claude-3.5-sonnet",
+            api_key_name = "OPENROUTER_API_KEY",
+        },
+    },
+})
+
+-- Quickly open or create an llm.md buffer for longer prompts
+vim.keymap.set("n", "<leader>ma", function() require("llm").create_llm_md() end)
+
+-- Pick an OpenRouter model via Telescope fuzzy search
+vim.keymap.set("n", "<leader>ms", function() require("llm").pick_openrouter_model() end)
+
+-- Stop an in-flight request if the model is still streaming
+vim.keymap.set("n", "<leader>mt", function() require("llm").cancel() end)
+
+vim.keymap.set("n", "<leader>,", function() require("llm").prompt({ replace = false, service = "openrouter" }) end)
+vim.keymap.set("v", "<leader>,", function() require("llm").prompt({ replace = false, service = "openrouter" }) end)
+vim.keymap.set("v", "<leader>.", function() require("llm").prompt({ replace = true, service = "openrouter" }) end)
+```
+
 **`prompt()`**
 
 Triggers the LLM assistant. You can pass an optional `replace` flag to replace the current selection with the LLM's response. The prompt is either the visually selected text or the file content up to the cursor if no selection is made.
@@ -93,6 +121,11 @@ Prints a token count for all files tracked in the current git repository. If the
 [`tiktoken`](https://github.com/openai/tiktoken) Python package is installed,
 it is used for an exact count; otherwise an estimate of one token per four
 characters is used. You can also call this via `:LLMTokenCount`.
+
+**`pick_openrouter_model()`**
+
+Queries `https://openrouter.ai/api/v1/models` and opens a Telescope picker so you can set
+the OpenRouter model for subsequent prompts. Requires `telescope.nvim` to be installed.
 
 **Example Bindings**
 ```lua
