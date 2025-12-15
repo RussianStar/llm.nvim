@@ -3,6 +3,33 @@ local diff = require("llm.diff")
 local M = {}
 
 local timeout_ms = 10000
+local log_level = vim.log.levels.INFO
+
+local function normalize_log_level(level)
+        if type(level) == "number" then
+                return level
+        end
+        if type(level) == "string" then
+                local name = level:upper()
+                return vim.log.levels[name] or log_level
+        end
+        return log_level
+end
+
+local function log(level, msg)
+        level = normalize_log_level(level)
+        if level < log_level then
+                return
+        end
+        local prefix = "llm.nvim: "
+        vim.schedule(function()
+                if vim and vim.notify then
+                        vim.notify(prefix .. msg, level)
+                else
+                        print(prefix .. msg)
+                end
+        end)
+end
 
 local default_openai_adapter = {
         build_chat_payload = function(args)
@@ -202,7 +229,13 @@ local function get_service(name)
 end
 
 function M.setup(opts)
+        opts = opts or {}
         timeout_ms = opts.timeout_ms or timeout_ms
+        if opts.log_level then
+                log_level = normalize_log_level(opts.log_level)
+        elseif opts.debug then
+                log_level = vim.log.levels.DEBUG
+        end
         if opts.services then
                 for key, service in pairs(opts.services) do
                         if not service.adapter then
@@ -355,6 +388,57 @@ local function write_at_mark(ctx, str)
         vim.api.nvim_buf_set_extmark(buf, ns, new_row, new_col, { id = mark })
 end
 
+local function split_lines(buffer)
+        local lines = {}
+        local idx = 1
+        while true do
+                local s, e = buffer:find("\r?\n", idx)
+                if not s then
+                        break
+                end
+                table.insert(lines, buffer:sub(idx, s - 1))
+                idx = e + 1
+        end
+        return lines, buffer:sub(idx)
+end
+
+local function handle_non_stream_body(body, ctx, service)
+        if not body or not body:match("%S") then
+            return false
+        end
+
+        log("info", "received non-stream response, attempting to parse")
+        local ok, data = pcall(vim.json.decode, body)
+        if not ok then
+                log("warn", "non-stream response is not valid json")
+                return false
+        end
+
+        if data.error then
+                local msg = data.error.message or vim.inspect(data.error)
+                log("error", "provider returned error: " .. msg)
+                print("llm.nvim error: " .. msg)
+                return false
+        end
+
+        local content
+        if service == "anthropic" then
+                content = ctx.adapter.extract_message_content(data.content, { trim_thinking = ctx.trim_thinking })
+        else
+                local message = data.choices and data.choices[1] and data.choices[1].message
+                content = ctx.adapter.extract_message_content(message, { trim_thinking = ctx.trim_thinking })
+        end
+
+        if content and content ~= "" then
+                write_at_mark(ctx, sanitize_content(content))
+                log("info", "wrote non-stream response to buffer (" .. #content .. " chars)")
+                return true
+        end
+
+        log("warn", "non-stream response had no content field")
+        return false
+end
+
 local function process_data_lines(lines, service, ctx, process_data)
         for _, line in ipairs(lines) do
                 local data_start = line:find("data: ")
@@ -362,15 +446,18 @@ local function process_data_lines(lines, service, ctx, process_data)
                         local json_str = line:sub(data_start + 6)
                         local stop = false
                         if line == "data: [DONE]" then
+                                log("debug", "received [DONE] signal")
                                 return true
                         end
                         local ok, data = pcall(vim.json.decode, json_str)
                         if not ok then
-                                print("llm.nvim: failed to parse response")
-                                return true
+                                log("warn", "failed to parse stream chunk")
+                                return false
                         end
                         if data.error then
-                                print("llm.nvim error: " .. (data.error.message or vim.inspect(data.error)))
+                                local msg = data.error.message or vim.inspect(data.error)
+                                print("llm.nvim error: " .. msg)
+                                log("error", "provider error: " .. msg)
                                 return true
                         end
                         if service == "anthropic" then
@@ -380,6 +467,7 @@ local function process_data_lines(lines, service, ctx, process_data)
                                 check_limits(data, service)
                                 return true
                         else
+                                log("debug", "processing streamed chunk")
                                 nio.sleep(5)
                                 vim.schedule(function()
                                         vim.api.nvim_buf_call(ctx.buf, function()
@@ -400,14 +488,22 @@ local function process_sse_response(ctx, service)
         local start_time = vim.uv.hrtime()
         current_responses[response] = ctx
 
+        local function finalize(reason)
+                current_responses[response] = nil
+                if reason then
+                        log("debug", "finalizing stream: " .. reason)
+                end
+        end
+
         nio.run(function()
                 nio.sleep(timeout_ms)
                 if current_responses[response] and not has_tokens then
+                        log("error", "request timed out after " .. timeout_ms .. "ms without receiving tokens")
                         response.stdout.close()
                         if response.kill then
                                 response:kill()
                         end
-                        current_responses[response] = nil
+                        finalize("timeout")
                         print("llm.nvim has timed out!")
                 end
         end)
@@ -416,39 +512,58 @@ local function process_sse_response(ctx, service)
                 local current_time = vim.uv.hrtime()
                 local elapsed = (current_time - start_time)
                 if elapsed >= timeout_ms * 1000000 and not has_tokens then
+                        log("error", "aborting after " .. timeout_ms .. "ms without tokens")
+                        finalize("elapsed timeout")
                         return
                 end
                 local chunk = response.stdout.read(1024)
                 local err_chunk = response.stderr.read(1024)
                 if err_chunk and #err_chunk > 0 then
-                        print("llm.nvim error: " .. err_chunk)
-                        break
+                        local msg = vim.trim(err_chunk)
+                        if msg ~= "" then
+                                log("warn", "curl stderr: " .. msg)
+                        end
                 end
                 if chunk == nil then
                         break
                 end
-                buffer = buffer .. chunk
+                if chunk ~= "" then
+                        buffer = buffer .. chunk
+                        log("debug", "read " .. tostring(#chunk) .. " bytes (buffer " .. #buffer .. ")")
 
-		local lines = {}
-		for line in buffer:gmatch("(.-)\r?\n") do
-			table.insert(lines, line)
-		end
-
-		buffer = buffer:sub(#table.concat(lines, "\n") + 1)
-
-                done = process_data_lines(lines, service, ctx, function(data)
-                        local content
-                        if ctx.adapter and ctx.adapter.extract_stream_content then
-                                content = ctx.adapter.extract_stream_content(data, { trim_thinking = ctx.trim_thinking })
+			local lines
+			lines, buffer = split_lines(buffer)
+                        if #lines > 0 then
+                                log("debug", "processing " .. tostring(#lines) .. " lines from stream")
                         end
-                        if content and content ~= vim.NIL and content ~= "" then
-                                content = sanitize_content(content)
-                                has_tokens = true
-                                write_at_mark(ctx, content)
-                        end
-                end)
+
+                        done = process_data_lines(lines, service, ctx, function(data)
+                                local content
+                                if ctx.adapter and ctx.adapter.extract_stream_content then
+                                        content = ctx.adapter.extract_stream_content(
+                                                data,
+                                                { trim_thinking = ctx.trim_thinking }
+                                        )
+                                end
+                                if content and content ~= vim.NIL and content ~= "" then
+                                        content = sanitize_content(content)
+                                        has_tokens = true
+                                        log("debug", "appending streamed content chunk (" .. #content .. " chars)")
+                                        write_at_mark(ctx, content)
+                                end
+                        end)
+                else
+                        nio.sleep(2)
+                end
         end
-        current_responses[response] = nil
+
+        if not has_tokens and buffer and buffer:match("%S") then
+                if handle_non_stream_body(buffer, ctx, service) then
+                        has_tokens = true
+                end
+        end
+
+        finalize("stream complete")
 end
 
 function M.prompt(opts)
@@ -504,6 +619,9 @@ Key capabilities:
                 print("Invalid service: " .. service)
                 return
         end
+
+        log("info", string.format("sending request to %s with model %s", service, model))
+        log("debug", "system prompt length: " .. #system_prompt .. ", user prompt length: " .. #prompt)
 
         adapter = adapter or default_openai_adapter
         trim_thinking = trim_thinking or false
