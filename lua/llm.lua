@@ -1,6 +1,7 @@
 local nio = require("nio")
 local diff = require("llm.diff")
 local store = require("llm.store")
+local ctxmod = require("llm.context")
 local M = {}
 
 local timeout_ms = 5000
@@ -1031,6 +1032,7 @@ local function build_system_prompt(bufnr, base_prompt)
         local ft = vim.bo[bufnr].filetype or "plain"
         local imports = collect_imports(bufnr)
         local imports_block = #imports > 0 and table.concat(imports, "\n") or "None detected"
+        local lsp_context = ctxmod.build_default_context(bufnr, { max_symbols = 40 })
         return table.concat({
                 base_prompt,
                 "",
@@ -1045,6 +1047,8 @@ local function build_system_prompt(bufnr, base_prompt)
                 string.format("Filetype: %s", ft),
                 "Imports:",
                 imports_block,
+                "LSP context:",
+                lsp_context ~= "" and lsp_context or "None",
                 "-------------------------------------------------------------------",
         }, "\n")
 end
@@ -1070,6 +1074,12 @@ function M.prompt(opts)
 	else
 		prompt = M.get_lines_until_cursor()
 	end
+
+        -- Append extra context if any has been added by the user
+        local extra_ctx = ctxmod.get_extra_context_string()
+        if extra_ctx ~= "" then
+                prompt = prompt .. "\n\nAdditional context:\n" .. extra_ctx
+        end
 
         local url = ""
         local model = ""
@@ -1479,6 +1489,11 @@ M.pick_openrouter_thinking = pick_openrouter_thinking
 M.pick_openrouter_thinking_effort = pick_openrouter_thinking_effort
 M.pick_openrouter_category = pick_openrouter_category
 M.set_category = set_category
+M.add_context_path = ctxmod.add_context_path
+M.add_current_context_file = ctxmod.add_current_buffer
+M.open_context_buffer = ctxmod.open_context_buffer
+M.pick_context_files = ctxmod.pick_context_files
+M.get_extra_context_string = ctxmod.get_extra_context_string
 
 function M.hide_thinking_tokens()
         local service = get_service("openrouter")

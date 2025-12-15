@@ -86,6 +86,11 @@ vim.keymap.set("n", "<leader>ml", function() require("llm").pick_openrouter_thin
 vim.keymap.set("n", "<leader>mt", function() require("llm").cancel() end, { desc = "LLM: cancel all" })
 vim.keymap.set("n", "<leader>md", function() require("llm").cancel_at_cursor() end, { desc = "LLM: cancel at cursor", silent = true })
 
+-- context helpers
+vim.keymap.set("n", "<leader>mx", function() require("llm").add_current_context_file() end, { desc = "LLM: add current file to context" })
+vim.keymap.set("n", "<leader>mf", function() require("llm").pick_context_files() end, { desc = "LLM: pick context files (Telescope)" })
+vim.keymap.set("n", "<leader>mo", function() require("llm").open_context_buffer() end, { desc = "LLM: open context list" })
+
 -- coding (default model)
 vim.keymap.set("n", "<leader>,", function()
   require("llm").set_category("openrouter", "coding")
