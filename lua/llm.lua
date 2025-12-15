@@ -2,7 +2,7 @@ local nio = require("nio")
 local diff = require("llm.diff")
 local M = {}
 
-local timeout_ms = 10000
+local timeout_ms = 5000
 local log_level = vim.log.levels.INFO
 
 local function normalize_log_level(level)
@@ -485,13 +485,33 @@ local function process_sse_response(ctx, service)
         local response = ctx.response
         local buffer = ""
         local has_tokens = false
+        local bytes_read = 0
+        local timed_out = false
+        local seen_lines = 0
+        local err_output = {}
         local start_time = vim.uv.hrtime()
         current_responses[response] = ctx
 
         local function finalize(reason)
                 current_responses[response] = nil
                 if reason then
-                        log("debug", "finalizing stream: " .. reason)
+                        log(
+                                "debug",
+                                string.format(
+                                        "finalizing stream: %s (bytes=%d, buffered=%d, lines=%d, tokens=%s)",
+                                        reason,
+                                        bytes_read,
+                                        #buffer,
+                                        seen_lines,
+                                        tostring(has_tokens)
+                                )
+                        )
+                end
+                if timed_out and not has_tokens then
+                        log(
+                                "info",
+                                "timeout without tokens — check network reachability, API key validity, model name/availability, org/plan limits, or provider-side rate limiting"
+                        )
                 end
         end
 
@@ -503,6 +523,7 @@ local function process_sse_response(ctx, service)
                         if response.kill then
                                 response:kill()
                         end
+                        timed_out = true
                         finalize("timeout")
                         print("llm.nvim has timed out!")
                 end
@@ -513,8 +534,8 @@ local function process_sse_response(ctx, service)
                 local elapsed = (current_time - start_time)
                 if elapsed >= timeout_ms * 1000000 and not has_tokens then
                         log("error", "aborting after " .. timeout_ms .. "ms without tokens")
-                        finalize("elapsed timeout")
-                        return
+                        timed_out = true
+                        break
                 end
                 local chunk = response.stdout.read(1024)
                 local err_chunk = response.stderr.read(1024)
@@ -522,6 +543,7 @@ local function process_sse_response(ctx, service)
                         local msg = vim.trim(err_chunk)
                         if msg ~= "" then
                                 log("warn", "curl stderr: " .. msg)
+                                table.insert(err_output, msg)
                         end
                 end
                 if chunk == nil then
@@ -529,12 +551,14 @@ local function process_sse_response(ctx, service)
                 end
                 if chunk ~= "" then
                         buffer = buffer .. chunk
+                        bytes_read = bytes_read + #chunk
                         log("debug", "read " .. tostring(#chunk) .. " bytes (buffer " .. #buffer .. ")")
 
 			local lines
 			lines, buffer = split_lines(buffer)
                         if #lines > 0 then
                                 log("debug", "processing " .. tostring(#lines) .. " lines from stream")
+                                seen_lines = seen_lines + #lines
                         end
 
                         done = process_data_lines(lines, service, ctx, function(data)
@@ -561,9 +585,20 @@ local function process_sse_response(ctx, service)
                 if handle_non_stream_body(buffer, ctx, service) then
                         has_tokens = true
                 end
+        elseif not has_tokens and #buffer == 0 then
+                local err_summary = table.concat(err_output, " | ")
+                log(
+                        "error",
+                        string.format(
+                                "no response body received (bytes=%d, stderr=%s) - possible causes: network block, invalid API key, model unavailable, or provider dropped stream",
+                                bytes_read,
+                                err_summary ~= "" and err_summary or "none"
+                        )
+                )
         end
 
-        finalize("stream complete")
+        local reason = timed_out and "timeout" or "stream complete"
+        finalize(reason)
 end
 
 function M.prompt(opts)
@@ -620,7 +655,18 @@ Key capabilities:
                 return
         end
 
-        log("info", string.format("sending request to %s with model %s", service, model))
+        local has_api_key = api_key_name and get_api_key(api_key_name) ~= nil
+        log(
+                "info",
+                string.format(
+                        "sending request to %s with model %s (timeout=%dms, trim_thinking=%s, api_key=%s)",
+                        service,
+                        model,
+                        timeout_ms,
+                        tostring(trim_thinking),
+                        has_api_key and "yes" or "no"
+                )
+        )
         log("debug", "system prompt length: " .. #system_prompt .. ", user prompt length: " .. #prompt)
 
         adapter = adapter or default_openai_adapter
@@ -662,9 +708,32 @@ Key capabilities:
 			table.insert(args, "-H")
 			table.insert(args, "Authorization: Bearer " .. api_key)
 		end
-	end
+        end
 
         table.insert(args, url)
+
+        -- Log request metadata without leaking secrets
+        local safe_headers = {}
+        for _, v in ipairs(args) do
+                if type(v) == "string" and v:match("^Authorization:") then
+                        table.insert(safe_headers, "Authorization: ***redacted***")
+                elseif type(v) == "string" and v:match("^x%-api%-key:") then
+                        table.insert(safe_headers, "x-api-key: ***redacted***")
+                elseif type(v) == "string" and v:match("^anthropic%-version:") then
+                        table.insert(safe_headers, v)
+                elseif type(v) == "string" and v:match("^Content%-Type:") then
+                        table.insert(safe_headers, v)
+                end
+        end
+        log(
+                "debug",
+                string.format(
+                        "curl args: method=POST url=%s headers=%s content_length=%d",
+                        url,
+                        vim.inspect(safe_headers),
+                        #vim.json.encode(data)
+                )
+        )
 
         -- capture buffer and position for streaming
         local buf = vim.api.nvim_get_current_buf()
