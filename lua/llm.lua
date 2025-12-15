@@ -522,6 +522,7 @@ Key capabilities:
         })
 
         local args = {
+                "-sS",
                 "-N",
                 "-X",
                 "POST",
