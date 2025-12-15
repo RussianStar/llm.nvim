@@ -73,14 +73,20 @@ local default_openai_adapter = {
                         return nil
                 end
 
+                -- Some providers send reasoning in a separate field
+                if delta.reasoning and delta.reasoning ~= "" and not opts.trim_thinking then
+                        return delta.reasoning
+                end
+
                 local content = delta.content
                 if type(content) == "table" then
                         local chunks = {}
                         for _, part in ipairs(content) do
-                                if part.type == "reasoning" and opts.trim_thinking then
-                                        goto continue
-                                end
-                                if part.type == "text" and part.text then
+                                if part.type == "reasoning" then
+                                        if not opts.trim_thinking and part.text then
+                                                table.insert(chunks, part.text)
+                                        end
+                                elseif part.type == "text" and part.text then
                                         table.insert(chunks, part.text)
                                 end
                                 ::continue::
@@ -100,23 +106,38 @@ local default_openai_adapter = {
         extract_message_content = function(message, opts)
                 opts = opts or {}
                 local content = message and message.content
+
+                -- Some providers include reasoning outside of content
+                local reasoning = (message and message.reasoning)
+
                 if type(content) == "table" then
                         local parts = {}
                         for _, item in ipairs(content) do
-                                if item.type == "reasoning" and opts.trim_thinking then
-                                        goto continue
-                                end
-                                if item.type == "text" and item.text then
+                                if item.type == "reasoning" then
+                                        if not opts.trim_thinking and item.text then
+                                                table.insert(parts, item.text)
+                                        end
+                                elseif item.type == "text" and item.text then
                                         table.insert(parts, item.text)
                                 end
                                 ::continue::
                         end
+                        if reasoning and not opts.trim_thinking then
+                                table.insert(parts, tostring(reasoning))
+                        end
                         return table.concat(parts, "")
                 elseif type(content) == "string" then
+                        if reasoning and not opts.trim_thinking then
+                                return content .. tostring(reasoning)
+                        end
                         if opts.trim_thinking then
                                 return content:gsub("<think>[%s%S]-</think>", "")
                         end
                         return content
+                end
+
+                if reasoning and not opts.trim_thinking then
+                        return tostring(reasoning)
                 end
                 return ""
         end,
@@ -142,9 +163,26 @@ local function ensure_progress_signs()
         sign_defined = true
 end
 
-local function place_progress_sign(bufnr, lnum)
+local function update_progress_sign(ctx, frame)
+        if not ctx.sign_id or ctx.stopped then
+                return
+        end
         ensure_progress_signs()
-        local ok, id = pcall(vim.fn.sign_place, 0, "llm", "llm_progress_1", bufnr, {
+        local pos = vim.api.nvim_buf_get_extmark_by_id(ctx.buf, ns, ctx.mark, {})
+        if not pos or #pos == 0 then
+                return
+        end
+        local lnum = pos[1] + 1
+        local name = "llm_progress_" .. frame
+        pcall(vim.fn.sign_unplace, "llm", { buffer = ctx.buf, id = ctx.sign_id })
+        pcall(vim.fn.sign_place, ctx.sign_id, "llm", name, ctx.buf, { lnum = lnum, priority = 15 })
+end
+
+local function place_progress_sign(ctx)
+        ensure_progress_signs()
+        local pos = vim.api.nvim_buf_get_extmark_by_id(ctx.buf, ns, ctx.mark, {})
+        local lnum = pos and pos[1] and (pos[1] + 1) or (vim.api.nvim_win_get_cursor(0)[1])
+        local ok, id = pcall(vim.fn.sign_place, 0, "llm", "llm_progress_1", ctx.buf, {
                 lnum = lnum,
                 priority = 15,
         })
@@ -160,14 +198,16 @@ local function place_progress_sign(bufnr, lnum)
                         spinner_interval,
                         spinner_interval,
                         vim.schedule_wrap(function()
+                                if ctx.stopped then
+                                        return
+                                end
                                 frame = frame % #spinner_frames + 1
-                                local name = "llm_progress_" .. frame
-                                pcall(vim.fn.sign_unplace, "llm", { buffer = bufnr, id = id })
-                                pcall(vim.fn.sign_place, id, "llm", name, bufnr, { lnum = lnum, priority = 15 })
+                                update_progress_sign(ctx, frame)
                         end)
                 )
         end
 
+        update_progress_sign(ctx, frame)
         return id, timer
 end
 
@@ -296,6 +336,7 @@ local service_lookup = {
                 api_key_name = "OPENROUTER_API_KEY",
                 adapter = default_openai_adapter,
                 trim_thinking = true,
+                stream_params = {},
         },
         anthropic = {
                 url = "https://api.anthropic.com/v1/messages",
@@ -331,7 +372,7 @@ function M.setup(opts)
                 progress_sign = vim.tbl_extend("force", progress_sign, opts.progress_sign)
                 sign_defined = false -- force re-define with new icon
         end
-        if opts.spinner_frames and vim.tbl_islist(opts.spinner_frames) and #opts.spinner_frames > 0 then
+        if opts.spinner_frames and vim.islist(opts.spinner_frames) and #opts.spinner_frames > 0 then
                 spinner_frames = opts.spinner_frames
                 sign_defined = false
         end
@@ -484,6 +525,137 @@ local function pick_openrouter_model()
                                 end
 
                                 actions.select_default:replace(set_model)
+                                return true
+                        end,
+                })
+                :find()
+end
+
+local function pick_openrouter_thinking()
+        local ok = pcall(require, "telescope")
+        if not ok then
+                print("llm.nvim: telescope.nvim is required for thinking mode selection")
+                return
+        end
+
+        local service = get_service("openrouter")
+        if not service then
+                return
+        end
+
+        local entries = {
+                { value = false, display = "Hide thinking tokens (default)", ordinal = "hide" },
+                { value = true, display = "Show thinking tokens", ordinal = "show" },
+        }
+
+        local pickers = require("telescope.pickers")
+        local finders = require("telescope.finders")
+        local conf = require("telescope.config").values
+        local actions = require("telescope.actions")
+        local action_state = require("telescope.actions.state")
+
+        pickers
+                .new({}, {
+                        prompt_title = "OpenRouter Thinking Mode",
+                        finder = finders.new_table({
+                                results = entries,
+                                entry_maker = function(entry)
+                                        return {
+                                                value = entry.value,
+                                                display = entry.display,
+                                                ordinal = entry.ordinal,
+                                        }
+                                end,
+                        }),
+                        sorter = conf.generic_sorter({}),
+                        attach_mappings = function(prompt_bufnr, _)
+                                local function set_mode()
+                                        local selection = action_state.get_selected_entry()
+                                        actions.close(prompt_bufnr)
+                                        if not selection then
+                                                return
+                                        end
+                                        service.trim_thinking = selection.value
+                                        store.save_last("openrouter", {
+                                                model = service.model,
+                                                trim_thinking = service.trim_thinking,
+                                                stream_params = service.stream_params,
+                                        })
+                                        local label = selection.value and "show" or "hide"
+                                        print("llm.nvim: OpenRouter thinking tokens set to " .. label)
+                                end
+
+                                actions.select_default:replace(set_mode)
+                                return true
+                        end,
+                })
+                :find()
+end
+
+local function pick_openrouter_thinking_effort()
+        local ok = pcall(require, "telescope")
+        if not ok then
+                print("llm.nvim: telescope.nvim is required for thinking effort selection")
+                return
+        end
+
+        local service = get_service("openrouter")
+        if not service then
+                return
+        end
+
+        local entries = {
+                { value = "low", display = "Low reasoning effort (faster/cheaper)" },
+                { value = "medium", display = "Medium reasoning effort (default)" },
+                { value = "high", display = "High reasoning effort (more tokens/slower)" },
+                { value = vim.NIL, display = "Unset (model default)" },
+        }
+
+        local pickers = require("telescope.pickers")
+        local finders = require("telescope.finders")
+        local conf = require("telescope.config").values
+        local actions = require("telescope.actions")
+        local action_state = require("telescope.actions.state")
+
+        pickers
+                .new({}, {
+                        prompt_title = "OpenRouter Reasoning / Thinking Effort",
+                        finder = finders.new_table({
+                                results = entries,
+                                entry_maker = function(entry)
+                                        return {
+                                                value = entry.value,
+                                                display = entry.display,
+                                                ordinal = entry.display,
+                                        }
+                                end,
+                        }),
+                        sorter = conf.generic_sorter({}),
+                        attach_mappings = function(prompt_bufnr, _)
+                                local function set_mode()
+                                        local selection = action_state.get_selected_entry()
+                                        actions.close(prompt_bufnr)
+                                        if not selection then
+                                                return
+                                        end
+                                        service.stream_params = service.stream_params or {}
+                                        if selection.value == vim.NIL then
+                                                service.stream_params.reasoning_effort = nil
+                                        else
+                                                service.stream_params.reasoning_effort = selection.value
+                                        end
+                                        store.save_last("openrouter", {
+                                                model = service.model,
+                                                trim_thinking = service.trim_thinking,
+                                                stream_params = service.stream_params,
+                                        })
+                                        print(
+                                                "llm.nvim: OpenRouter reasoning_effort set to "
+                                                        .. tostring(selection.value or "default")
+                                        )
+                                end
+
+                                actions.select_default:replace(set_mode)
                                 return true
                         end,
                 })
@@ -665,7 +837,7 @@ local function process_sse_response(ctx, service)
         end
 
         local function maybe_log_timeout()
-                if timeout_logged or has_output then
+                if timeout_logged or has_output or ctx.stopped or ctx.user_cancelled then
                         return
                 end
                 local elapsed_ms = (vim.uv.hrtime() - start_time) / 1e6
@@ -679,13 +851,13 @@ local function process_sse_response(ctx, service)
 
         local done = false
         while not done do
+                if ctx.stopped or ctx.user_cancelled then
+                        finalize("cancelled")
+                        return
+                end
                 maybe_log_timeout()
                 local chunk = response.stdout.read(1)
                 local err_chunk = response.stderr.read(1)
-                if ctx.user_cancelled then
-                        finalize("cancelled by user")
-                        return
-                end
                 if err_chunk and #err_chunk > 0 then
                         local msg = vim.trim(err_chunk)
                         if msg ~= "" then
@@ -719,7 +891,10 @@ local function process_sse_response(ctx, service)
                                 if content and content ~= vim.NIL and content ~= "" then
                                         content = sanitize_content(content)
                                         has_tokens = true
-                                        write_at_mark(ctx, content)
+                                        if not ctx.stopped and not ctx.user_cancelled then
+                                                write_at_mark(ctx, content)
+                                                update_progress_sign(ctx, 1)
+                                        end
                                 end
                         end)
                 else
@@ -921,21 +1096,21 @@ function M.prompt(opts)
         -- insert a new line where output will be written
         vim.api.nvim_buf_set_lines(buf, row, row, true, { "" })
         local mark = vim.api.nvim_buf_set_extmark(buf, ns, row, 0, {})
-        local sign_id, spinner_timer = place_progress_sign(buf, row + 1)
+        local ctx = {
+                buf = buf,
+                mark = mark,
+        }
+        local sign_id, spinner_timer = place_progress_sign(ctx)
 
         local response = nio.process.run({
                 cmd = "curl",
                 args = args,
         })
-        local ctx = {
-                buf = buf,
-                mark = mark,
-                sign_id = sign_id,
-                spinner_timer = spinner_timer,
-                response = response,
-                adapter = adapter,
-                trim_thinking = trim_thinking,
-        }
+        ctx.sign_id = sign_id
+        ctx.spinner_timer = spinner_timer
+        ctx.response = response
+        ctx.adapter = adapter
+        ctx.trim_thinking = trim_thinking
         nio.run(function()
                 process_sse_response(ctx, service)
         end)
@@ -1070,6 +1245,7 @@ function M.cancel()
                 if ctx.response.kill then
                         ctx.response:kill()
                 end
+                stop_ctx(ctx, "request cancelled")
                 cancelled = true
         end
         current_responses = {}
@@ -1078,6 +1254,24 @@ function M.cancel()
         else
                 print("llm.nvim: no active request")
         end
+end
+
+function M.cancel_at_cursor()
+        local buf = vim.api.nvim_get_current_buf()
+        local row = vim.api.nvim_win_get_cursor(0)[1]
+        for _, ctx in pairs(current_responses) do
+                if ctx.buf == buf then
+                        local pos = vim.api.nvim_buf_get_extmark_by_id(buf, ns, ctx.mark, {})
+                        if pos and pos[1] + 1 == row then
+                                nio.run(function()
+                                        stop_ctx(ctx, "request cancelled at cursor line")
+                                end)
+                                print("llm.nvim: cancelled request at line " .. row)
+                                return
+                        end
+                end
+        end
+        print("llm.nvim: no request at cursor line")
 end
 
 function M.get_visual_selection()
@@ -1191,5 +1385,21 @@ function M.create_llm_md()
 end
 
 M.pick_openrouter_model = pick_openrouter_model
+M.pick_openrouter_thinking = pick_openrouter_thinking
+M.pick_openrouter_thinking_effort = pick_openrouter_thinking_effort
+
+function M.hide_thinking_tokens()
+        local service = get_service("openrouter")
+        if not service then
+                return
+        end
+        service.trim_thinking = true
+        store.save_last("openrouter", {
+                model = service.model,
+                trim_thinking = service.trim_thinking,
+                stream_params = service.stream_params,
+        })
+        print("llm.nvim: OpenRouter thinking tokens will be trimmed")
+end
 
 return M
