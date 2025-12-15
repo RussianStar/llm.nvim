@@ -73,8 +73,8 @@ require('llm').setup({
 -- Quickly open or create an llm.md buffer for longer prompts
 vim.keymap.set("n", "<leader>ma", function() require("llm").create_llm_md() end)
 
--- Check the token count for files in the current git repo
-vim.keymap.set("n", "<leader>ms", function() require("llm").token_count() end)
+-- Pick an OpenRouter model via Telescope fuzzy search
+vim.keymap.set("n", "<leader>ms", function() require("llm").pick_openrouter_model() end)
 
 -- Stop an in-flight request if the model is still streaming
 vim.keymap.set("n", "<leader>mt", function() require("llm").cancel() end)
@@ -121,6 +121,11 @@ Prints a token count for all files tracked in the current git repository. If the
 [`tiktoken`](https://github.com/openai/tiktoken) Python package is installed,
 it is used for an exact count; otherwise an estimate of one token per four
 characters is used. You can also call this via `:LLMTokenCount`.
+
+**`pick_openrouter_model()`**
+
+Queries `https://openrouter.ai/api/v1/models` and opens a Telescope picker so you can set
+the OpenRouter model for subsequent prompts. Requires `telescope.nvim` to be installed.
 
 **Example Bindings**
 ```lua
