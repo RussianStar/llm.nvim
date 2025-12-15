@@ -1,9 +1,18 @@
 local nio = require("nio")
 local diff = require("llm.diff")
+local store = require("llm.store")
 local M = {}
 
 local timeout_ms = 5000
 local log_level = vim.log.levels.INFO
+local sign_defined = false
+local spinner_frames = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+local spinner_interval = 100
+local progress_sign = {
+        text = ">>",
+        texthl = "DiagnosticHint",
+        numhl = "DiagnosticHint",
+}
 
 local function normalize_log_level(level)
         if type(level) == "number" then
@@ -118,6 +127,88 @@ local current_responses = {}
 
 -- Namespace for extmarks used when streaming results
 local ns = vim.api.nvim_create_namespace("llm")
+
+local function ensure_progress_signs()
+        if sign_defined then
+                return
+        end
+        for i, ch in ipairs(spinner_frames) do
+                pcall(vim.fn.sign_define, "llm_progress_" .. i, {
+                        text = ch,
+                        texthl = progress_sign.texthl,
+                        numhl = progress_sign.numhl,
+                })
+        end
+        sign_defined = true
+end
+
+local function place_progress_sign(bufnr, lnum)
+        ensure_progress_signs()
+        local ok, id = pcall(vim.fn.sign_place, 0, "llm", "llm_progress_1", bufnr, {
+                lnum = lnum,
+                priority = 15,
+        })
+        if not ok then
+                log("debug", "failed to place progress sign: " .. tostring(id))
+                return nil, nil
+        end
+
+        local frame = 1
+        local timer = vim.loop.new_timer()
+        if timer then
+                timer:start(
+                        spinner_interval,
+                        spinner_interval,
+                        vim.schedule_wrap(function()
+                                frame = frame % #spinner_frames + 1
+                                local name = "llm_progress_" .. frame
+                                pcall(vim.fn.sign_unplace, "llm", { buffer = bufnr, id = id })
+                                pcall(vim.fn.sign_place, id, "llm", name, bufnr, { lnum = lnum, priority = 15 })
+                        end)
+                )
+        end
+
+        return id, timer
+end
+
+local function remove_progress_sign(bufnr, id)
+        if not id then
+                return
+        end
+        pcall(vim.fn.sign_unplace, "llm", { buffer = bufnr, id = id })
+end
+
+local function stop_ctx(ctx, reason)
+        if ctx.stopped then
+                return
+        end
+        ctx.stopped = true
+
+        remove_progress_sign(ctx.buf, ctx.sign_id)
+
+        if current_responses[ctx.response] then
+                        current_responses[ctx.response] = nil
+        end
+
+        if ctx.response then
+                if ctx.response.stdout and ctx.response.stdout.close then
+                        ctx.response.stdout.close()
+                end
+                if ctx.response.kill then
+                        pcall(ctx.response.kill, ctx.response)
+                end
+        end
+
+        if ctx.spinner_timer then
+                pcall(ctx.spinner_timer.stop, ctx.spinner_timer)
+                pcall(ctx.spinner_timer.close, ctx.spinner_timer)
+                ctx.spinner_timer = nil
+        end
+
+        if reason then
+                log("info", reason)
+        end
+end
 
 -- Remove unwanted characters from streamed content
 local function sanitize_content(content)
@@ -236,6 +327,17 @@ function M.setup(opts)
         elseif opts.debug then
                 log_level = vim.log.levels.DEBUG
         end
+        if opts.progress_sign then
+                progress_sign = vim.tbl_extend("force", progress_sign, opts.progress_sign)
+                sign_defined = false -- force re-define with new icon
+        end
+        if opts.spinner_frames and vim.tbl_islist(opts.spinner_frames) and #opts.spinner_frames > 0 then
+                spinner_frames = opts.spinner_frames
+                sign_defined = false
+        end
+        if opts.spinner_interval then
+                spinner_interval = opts.spinner_interval
+        end
         if opts.services then
                 for key, service in pairs(opts.services) do
                         if not service.adapter then
@@ -243,6 +345,32 @@ function M.setup(opts)
                         end
                         service_lookup[key] = service
                 end
+        end
+
+        local last = store.load_last()
+        if last and last.service and service_lookup[last.service] then
+                local svc = service_lookup[last.service]
+                if last.model then
+                        svc.model = last.model
+                end
+                if last.trim_thinking ~= nil then
+                        svc.trim_thinking = last.trim_thinking
+                end
+                if last.stream_params then
+                        svc.stream_params = last.stream_params
+                end
+                -- ignore stored headers to avoid sending optional OpenRouter headers by default
+                if last.data_collection ~= nil then
+                        svc.data_collection = last.data_collection
+                end
+                log(
+                        "info",
+                        string.format(
+                                "restored last model '%s' for service '%s'",
+                                tostring(last.model),
+                                tostring(last.service)
+                        )
+                )
         end
 end
 
@@ -348,6 +476,11 @@ local function pick_openrouter_model()
 
                                         service.model = selection.value
                                         print("llm.nvim: OpenRouter model set to " .. selection.value)
+                                        store.save_last("openrouter", {
+                                                model = selection.value,
+                                                trim_thinking = service.trim_thinking,
+                                                stream_params = service.stream_params,
+                                        })
                                 end
 
                                 actions.select_default:replace(set_model)
@@ -379,7 +512,9 @@ local function write_at_mark(ctx, str)
         local lines = vim.split(str, "\n")
         vim.api.nvim_buf_call(buf, function()
                 pcall(vim.cmd, "undojoin")
+                ctx.writing = true
                 vim.api.nvim_buf_set_text(buf, row, col, row, col, lines)
+                ctx.writing = false
         end)
 
         local last_line = lines[#lines]
@@ -418,6 +553,17 @@ local function handle_non_stream_body(body, ctx, service)
                 local msg = data.error.message or vim.inspect(data.error)
                 log("error", "provider returned error: " .. msg)
                 print("llm.nvim error: " .. msg)
+
+                -- surface full response for troubleshooting
+                log("error", "full error response (parsed): " .. vim.inspect(data))
+                log("error", "full error response (raw): " .. body)
+
+                if msg:lower():find("data policy") or msg:lower():find("privacy") then
+                        log(
+                                "info",
+                                "OpenRouter data policy mismatch. Free models often require allowing publication/training at https://openrouter.ai/settings/privacy; adjust there or pick a paid/privacy-compatible model."
+                        )
+                end
                 return false
         end
 
@@ -458,6 +604,7 @@ local function process_data_lines(lines, service, ctx, process_data)
                                 local msg = data.error.message or vim.inspect(data.error)
                                 print("llm.nvim error: " .. msg)
                                 log("error", "provider error: " .. msg)
+                                log("error", "full error chunk: " .. vim.inspect(data))
                                 return true
                         end
                         if service == "anthropic" then
@@ -485,15 +632,16 @@ local function process_sse_response(ctx, service)
         local response = ctx.response
         local buffer = ""
         local has_tokens = false
+        local has_output = false
         local bytes_read = 0
-        local timed_out = false
         local seen_lines = 0
         local err_output = {}
+        local timed_out = false
+        local timeout_logged = false
         local start_time = vim.uv.hrtime()
         current_responses[response] = ctx
 
         local function finalize(reason)
-                current_responses[response] = nil
                 if reason then
                         log(
                                 "debug",
@@ -513,37 +661,37 @@ local function process_sse_response(ctx, service)
                                 "timeout without tokens — check network reachability, API key validity, model name/availability, org/plan limits, or provider-side rate limiting"
                         )
                 end
+                stop_ctx(ctx)
         end
 
-        nio.run(function()
-                nio.sleep(timeout_ms)
-                if current_responses[response] and not has_tokens then
-                        log("error", "request timed out after " .. timeout_ms .. "ms without receiving tokens")
-                        response.stdout.close()
-                        if response.kill then
-                                response:kill()
-                        end
+        local function maybe_log_timeout()
+                if timeout_logged or has_output then
+                        return
+                end
+                local elapsed_ms = (vim.uv.hrtime() - start_time) / 1e6
+                if elapsed_ms >= timeout_ms and not has_tokens then
                         timed_out = true
-                        finalize("timeout")
+                        timeout_logged = true
+                        log("error", "request timed out after " .. timeout_ms .. "ms without receiving any output")
                         print("llm.nvim has timed out!")
                 end
-        end)
+        end
+
         local done = false
         while not done do
-                local current_time = vim.uv.hrtime()
-                local elapsed = (current_time - start_time)
-                if elapsed >= timeout_ms * 1000000 and not has_tokens then
-                        log("error", "aborting after " .. timeout_ms .. "ms without tokens")
-                        timed_out = true
-                        break
+                maybe_log_timeout()
+                local chunk = response.stdout.read(1)
+                local err_chunk = response.stderr.read(1)
+                if ctx.user_cancelled then
+                        finalize("cancelled by user")
+                        return
                 end
-                local chunk = response.stdout.read(1024)
-                local err_chunk = response.stderr.read(1024)
                 if err_chunk and #err_chunk > 0 then
                         local msg = vim.trim(err_chunk)
                         if msg ~= "" then
                                 log("warn", "curl stderr: " .. msg)
                                 table.insert(err_output, msg)
+                                has_output = true
                         end
                 end
                 if chunk == nil then
@@ -552,12 +700,11 @@ local function process_sse_response(ctx, service)
                 if chunk ~= "" then
                         buffer = buffer .. chunk
                         bytes_read = bytes_read + #chunk
-                        log("debug", "read " .. tostring(#chunk) .. " bytes (buffer " .. #buffer .. ")")
+                        has_output = true
 
-			local lines
-			lines, buffer = split_lines(buffer)
+                        local lines
+                        lines, buffer = split_lines(buffer)
                         if #lines > 0 then
-                                log("debug", "processing " .. tostring(#lines) .. " lines from stream")
                                 seen_lines = seen_lines + #lines
                         end
 
@@ -572,18 +719,19 @@ local function process_sse_response(ctx, service)
                                 if content and content ~= vim.NIL and content ~= "" then
                                         content = sanitize_content(content)
                                         has_tokens = true
-                                        log("debug", "appending streamed content chunk (" .. #content .. " chars)")
                                         write_at_mark(ctx, content)
                                 end
                         end)
                 else
-                        nio.sleep(2)
+                        -- brief yield to avoid busy-wait but keep latency low
+                        nio.sleep(10)
                 end
         end
 
         if not has_tokens and buffer and buffer:match("%S") then
                 if handle_non_stream_body(buffer, ctx, service) then
                         has_tokens = true
+                        has_output = true
                 end
         elseif not has_tokens and #buffer == 0 then
                 local err_summary = table.concat(err_output, " | ")
@@ -597,8 +745,43 @@ local function process_sse_response(ctx, service)
                 )
         end
 
-        local reason = timed_out and "timeout" or "stream complete"
-        finalize(reason)
+        finalize(timed_out and "timeout" or "stream complete")
+end
+
+local function collect_imports(bufnr, max_lines)
+        max_lines = max_lines or 200
+        local lines = vim.api.nvim_buf_get_lines(bufnr, 0, max_lines, false)
+        local imports = {}
+        for _, l in ipairs(lines) do
+                if l:match("^%s*#include") or l:match("^%s*import ") or l:match("^%s*from .+ import") or l:match("^%s*use ") or l:match("^%s*using ") or l:match("^%s*require") then
+                        table.insert(imports, l)
+                end
+        end
+        return imports
+end
+
+local default_base_prompt = [[I am an experienced software developer who doesn't need install or other basic information. If I do, I will ask. I value creativity and boldness, living a vital and expressive life.]]
+
+local function build_system_prompt(bufnr, base_prompt)
+        local ft = vim.bo[bufnr].filetype or "plain"
+        local imports = collect_imports(bufnr)
+        local imports_block = #imports > 0 and table.concat(imports, "\n") or "None detected"
+        return table.concat({
+                base_prompt,
+                "",
+                "-- Editor context --------------------------------------------------",
+                "You are inside Neovim. Respond with text to insert into the buffer only (no Markdown fences, no headings).",
+                "If explanation is needed, write it as comments in the target language at the top; otherwise output code only.",
+                "Prefer adding comments inline or directly above new code; keep them minimal and relevant.",
+                "Do not include installation/setup steps unless explicitly requested.",
+                "Never echo the user's prompt; do not add surrounding prose.",
+                "Adopt the file's language style and existing imports.",
+                "",
+                string.format("Filetype: %s", ft),
+                "Imports:",
+                imports_block,
+                "-------------------------------------------------------------------",
+        }, "\n")
 end
 
 function M.prompt(opts)
@@ -606,24 +789,14 @@ function M.prompt(opts)
 	local service = opts.service
 	local prompt = ""
 	local visual_lines = M.get_visual_selection()
-	local system_prompt = [[
-You are an AI programming assistant integrated into a code editor. Your purpose is to help the user with programming tasks as they write code.
-Key capabilities:
-- Thoroughly analyze the user's code and provide insightful suggestions for improvements related to best practices, performance, readability, and maintainability. Explain your reasoning.
-- Answer coding questions in detail, using examples from the user's own code when relevant. Break down complex topics step-by-step.
-- Spot potential bugs and logical errors. Alert the user and suggest fixes.
-- Upon request, add helpful comments explaining complex or unclear code.
-- Suggest relevant documentation, StackOverflow answers, and other resources related to the user's code and questions.
-- Engage in back-and-forth conversations to understand the user's intent and provide the most helpful information.
-- Keep concise and use markdown.
-- When asked to create code, only generate the code. No bugs.
-- Think step by step
-    ]]
+        local buf = vim.api.nvim_get_current_buf()
+        local base_prompt = opts.base_prompt or default_base_prompt
+	local system_prompt = build_system_prompt(buf, base_prompt)
 	if visual_lines then
 		prompt = table.concat(visual_lines, "\n")
 		if replace then
 			system_prompt =
-				"Follow the instructions in the code comments. Generate code only. Think step by step. If you must speak, do so in comments. Generate valid code only."
+				build_system_prompt(buf, base_prompt)
 			vim.api.nvim_command("normal! d")
 			vim.api.nvim_command("normal! k")
 		else
@@ -673,6 +846,13 @@ Key capabilities:
         trim_thinking = trim_thinking or false
 
         local api_key = api_key_name and get_api_key(api_key_name)
+
+        -- Persist last-used configuration for convenience
+        store.save_last(service, {
+                model = model,
+                trim_thinking = trim_thinking,
+                stream_params = stream_params,
+        })
 
         local data
         data = adapter.build_chat_payload({
@@ -741,12 +921,21 @@ Key capabilities:
         -- insert a new line where output will be written
         vim.api.nvim_buf_set_lines(buf, row, row, true, { "" })
         local mark = vim.api.nvim_buf_set_extmark(buf, ns, row, 0, {})
+        local sign_id, spinner_timer = place_progress_sign(buf, row + 1)
 
         local response = nio.process.run({
                 cmd = "curl",
                 args = args,
         })
-        local ctx = { buf = buf, mark = mark, response = response, adapter = adapter, trim_thinking = trim_thinking }
+        local ctx = {
+                buf = buf,
+                mark = mark,
+                sign_id = sign_id,
+                spinner_timer = spinner_timer,
+                response = response,
+                adapter = adapter,
+                trim_thinking = trim_thinking,
+        }
         nio.run(function()
                 process_sse_response(ctx, service)
         end)
@@ -875,6 +1064,8 @@ end
 function M.cancel()
         local cancelled = false
         for _, ctx in pairs(current_responses) do
+                remove_progress_sign(ctx.buf, ctx.sign_id)
+                ctx.user_cancelled = true
                 ctx.response.stdout.close()
                 if ctx.response.kill then
                         ctx.response:kill()
