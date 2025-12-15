@@ -56,6 +56,34 @@ require('llm').setup({
 })
 ```
 
+**Example OpenRouter Configuration**
+
+```lua
+require('llm').setup({
+    timeout_ms = 14000,
+    services = {
+        openrouter = {
+            url = "https://openrouter.ai/api/v1/chat/completions",
+            model = "anthropic/claude-3.5-sonnet",
+            api_key_name = "OPENROUTER_API_KEY",
+        },
+    },
+})
+
+-- Quickly open or create an llm.md buffer for longer prompts
+vim.keymap.set("n", "<leader>ma", function() require("llm").create_llm_md() end)
+
+-- Check the token count for files in the current git repo
+vim.keymap.set("n", "<leader>ms", function() require("llm").token_count() end)
+
+-- Stop an in-flight request if the model is still streaming
+vim.keymap.set("n", "<leader>mt", function() require("llm").cancel() end)
+
+vim.keymap.set("n", "<leader>,", function() require("llm").prompt({ replace = false, service = "openrouter" }) end)
+vim.keymap.set("v", "<leader>,", function() require("llm").prompt({ replace = false, service = "openrouter" }) end)
+vim.keymap.set("v", "<leader>.", function() require("llm").prompt({ replace = true, service = "openrouter" }) end)
+```
+
 **`prompt()`**
 
 Triggers the LLM assistant. You can pass an optional `replace` flag to replace the current selection with the LLM's response. The prompt is either the visually selected text or the file content up to the cursor if no selection is made.
