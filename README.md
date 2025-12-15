@@ -56,32 +56,65 @@ require('llm').setup({
 })
 ```
 
-**Example OpenRouter Configuration**
+**Example OpenRouter Configuration with Categories (coding / thinking / util)**
 
 ```lua
-require('llm').setup({
-    timeout_ms = 14000,
-    services = {
-        openrouter = {
-            url = "https://openrouter.ai/api/v1/chat/completions",
-            model = "anthropic/claude-3.5-sonnet",
-            api_key_name = "OPENROUTER_API_KEY",
-        },
+require("llm").setup({
+  timeout_ms = 4000,
+  services = {
+    openrouter = {
+      url = "https://openrouter.ai/api/v1/chat/completions",
+      api_key_name = "OPENROUTER_API_KEY",
+      models = {
+        coding   = "anthropic/claude-3.5-sonnet",   -- default general coding
+        thinking = "moonshotai/kimi-k2-thinking",   -- heavy reasoning
+        util     = "gpt-4o-mini",                   -- lightweight utility
+      },
+      category = "coding", -- default category used for prompts
     },
+  },
+  progress_sign   = { texthl = "GitSignsAdd", numhl = "GitSignsAddNr" },
+  spinner_frames  = { "⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏" },
+  spinner_interval = 100,
 })
 
--- Quickly open or create an llm.md buffer for longer prompts
-vim.keymap.set("n", "<leader>ma", function() require("llm").create_llm_md() end)
+-- scratch / management
+vim.keymap.set("n", "<leader>ma", function() require("llm").create_llm_md() end, { desc = "LLM: create llm scratch pad" })
+vim.keymap.set("n", "<leader>ms", function() require("llm").pick_openrouter_model() end, { desc = "LLM: Pick model" })
+vim.keymap.set("n", "<leader>mc", function() require("llm").pick_openrouter_category() end, { desc = "LLM: Pick category (coding/thinking/util)" })
+vim.keymap.set("n", "<leader>ml", function() require("llm").pick_openrouter_thinking_effort() end, { desc = "LLM: reasoning effort" })
+vim.keymap.set("n", "<leader>mt", function() require("llm").cancel() end, { desc = "LLM: cancel all" })
+vim.keymap.set("n", "<leader>md", function() require("llm").cancel_at_cursor() end, { desc = "LLM: cancel at cursor", silent = true })
 
--- Pick an OpenRouter model via Telescope fuzzy search
-vim.keymap.set("n", "<leader>ms", function() require("llm").pick_openrouter_model() end)
+-- coding (default model)
+vim.keymap.set("n", "<leader>,", function()
+  require("llm").set_category("openrouter", "coding")
+  require("llm").prompt({ replace = false, service = "openrouter" })
+end, { desc = "LLM: Add (coding)" })
+vim.keymap.set("v", "<leader>,", function()
+  require("llm").set_category("openrouter", "coding")
+  require("llm").prompt({ replace = false, service = "openrouter" })
+end, { desc = "LLM: Add (coding)" })
+vim.keymap.set("v", "<leader>.", function()
+  require("llm").set_category("openrouter", "coding")
+  require("llm").prompt({ replace = true, service = "openrouter" })
+end, { desc = "LLM: Replace (coding)" })
 
--- Stop an in-flight request if the model is still streaming
-vim.keymap.set("n", "<leader>mt", function() require("llm").cancel() end)
+-- thinking (heavy model)
+vim.keymap.set("n", "<leader>;", function()
+  require("llm").set_category("openrouter", "thinking")
+  require("llm").prompt({ replace = false, service = "openrouter" })
+end, { desc = "LLM: Add (thinking)" })
+vim.keymap.set("v", "<leader>;", function()
+  require("llm").set_category("openrouter", "thinking")
+  require("llm").prompt({ replace = false, service = "openrouter" })
+end, { desc = "LLM: Add (thinking)" })
+vim.keymap.set("v", "<leader>:", function()
+  require("llm").set_category("openrouter", "thinking")
+  require("llm").prompt({ replace = true, service = "openrouter" })
+end, { desc = "LLM: Replace (thinking)" })
 
-vim.keymap.set("n", "<leader>,", function() require("llm").prompt({ replace = false, service = "openrouter" }) end)
-vim.keymap.set("v", "<leader>,", function() require("llm").prompt({ replace = false, service = "openrouter" }) end)
-vim.keymap.set("v", "<leader>.", function() require("llm").prompt({ replace = true, service = "openrouter" }) end)
+-- add similar mappings for util if desired, swapping category to "util"
 ```
 
 **`prompt()`**

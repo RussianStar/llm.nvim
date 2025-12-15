@@ -42,6 +42,7 @@ function M.save_last(service_name, cfg)
         data.last = {
                 service = service_name,
                 model = cfg.model,
+                category = cfg.category,
                 trim_thinking = cfg.trim_thinking,
                 stream_params = cfg.stream_params,
                 data_collection = cfg.data_collection,

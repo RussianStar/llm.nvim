@@ -337,6 +337,12 @@ local service_lookup = {
                 adapter = default_openai_adapter,
                 trim_thinking = true,
                 stream_params = {},
+                models = {
+                        coding = "gpt-4o-mini",
+                        thinking = "anthropic/claude-3.5-sonnet",
+                        util = "qwen/qwen-2.5-7b",
+                },
+                category = "coding",
         },
         anthropic = {
                 url = "https://api.anthropic.com/v1/messages",
@@ -393,6 +399,9 @@ function M.setup(opts)
                 local svc = service_lookup[last.service]
                 if last.model then
                         svc.model = last.model
+                end
+                if last.category then
+                        svc.category = last.category
                 end
                 if last.trim_thinking ~= nil then
                         svc.trim_thinking = last.trim_thinking
@@ -583,6 +592,87 @@ local function pick_openrouter_thinking()
                                         })
                                         local label = selection.value and "show" or "hide"
                                         print("llm.nvim: OpenRouter thinking tokens set to " .. label)
+                                end
+
+                                actions.select_default:replace(set_mode)
+                                return true
+                        end,
+                })
+                :find()
+end
+
+local function set_category(service_name, category)
+        local svc = service_lookup[service_name]
+        if not svc then
+                print("llm.nvim: unknown service " .. tostring(service_name))
+                return false
+        end
+        svc.category = category
+        if svc.models and svc.models[category] then
+                svc.model = svc.models[category]
+        end
+        store.save_last(service_name, {
+                model = svc.model,
+                category = svc.category,
+                trim_thinking = svc.trim_thinking,
+                stream_params = svc.stream_params,
+        })
+        print(
+                string.format(
+                        "llm.nvim: %s category set to %s (%s)",
+                        service_name,
+                        category,
+                        tostring(svc.model)
+                )
+        )
+        return true
+end
+
+local function pick_openrouter_category()
+        local ok = pcall(require, "telescope")
+        if not ok then
+                print("llm.nvim: telescope.nvim is required for category selection")
+                return
+        end
+        local svc = get_service("openrouter")
+        if not svc then
+                return
+        end
+        local models = svc.models or {}
+        local entries = {
+                { cat = "coding", desc = "Coding (default)", model = models.coding },
+                { cat = "thinking", desc = "Thinking (heavy reasoning)", model = models.thinking },
+                { cat = "util", desc = "Utility (lightweight/misc)", model = models.util },
+        }
+        local pickers = require("telescope.pickers")
+        local finders = require("telescope.finders")
+        local conf = require("telescope.config").values
+        local actions = require("telescope.actions")
+        local action_state = require("telescope.actions.state")
+
+        pickers
+                .new({}, {
+                        prompt_title = "OpenRouter Category",
+                        finder = finders.new_table({
+                                results = entries,
+                                entry_maker = function(entry)
+                                        local display = string.format("%-8s | %s", entry.cat, entry.model or "unset")
+                                        return {
+                                                value = entry,
+                                                display = display,
+                                                ordinal = display .. " " .. entry.desc,
+                                        }
+                                end,
+                        }),
+                        sorter = conf.generic_sorter({}),
+                        attach_mappings = function(prompt_bufnr, _)
+                                local function set_mode()
+                                        local selection = action_state.get_selected_entry()
+                                        actions.close(prompt_bufnr)
+                                        if not selection or not selection.value then
+                                                return
+                                        end
+                                        set_category("openrouter", selection.value.cat)
                                 end
 
                                 actions.select_default:replace(set_mode)
@@ -1387,6 +1477,8 @@ end
 M.pick_openrouter_model = pick_openrouter_model
 M.pick_openrouter_thinking = pick_openrouter_thinking
 M.pick_openrouter_thinking_effort = pick_openrouter_thinking_effort
+M.pick_openrouter_category = pick_openrouter_category
+M.set_category = set_category
 
 function M.hide_thinking_tokens()
         local service = get_service("openrouter")
