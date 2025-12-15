@@ -167,6 +167,7 @@ local function parse_line(line)
 end
 
 function M.open_context_buffer()
+  local win
   local buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_name(buf, "llm://context")
   vim.bo[buf].buftype = "acwrite"
@@ -200,7 +201,13 @@ function M.open_context_buffer()
         end
       end
       rebuild_entries()
-      print("llm.nvim: context list updated (" .. #context_paths .. " files)")
+      vim.schedule(function()
+        if vim and vim.notify then
+          vim.notify("llm.nvim: context list updated (" .. #context_paths .. " files)", vim.log.levels.INFO)
+        end
+      end)
+      -- mark buffer clean so :wq or :close won't prompt or hang
+      vim.api.nvim_buf_set_option(buf, "modified", false)
     end,
   })
 
@@ -228,6 +235,39 @@ function M.open_context_buffer()
     row = row,
     col = col,
   })
+end
+
+local function find_context_buf()
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(b) then
+      if vim.api.nvim_buf_get_name(b) == "llm://context" then
+        return b
+      end
+    end
+  end
+end
+
+function M.close_context_buffer(opts)
+  opts = opts or {}
+  local buf = find_context_buf()
+  if not buf then
+    print("llm.nvim: context buffer not open")
+    return
+  end
+  -- Try to save changes to update context_paths unless discard=true
+  if not opts.discard then
+    pcall(vim.api.nvim_buf_call, buf, function()
+      pcall(vim.cmd, "silent write")
+    end)
+  end
+  for _, winid in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_win_is_valid(winid) and vim.api.nvim_win_get_buf(winid) == buf then
+      pcall(vim.api.nvim_win_close, winid, true)
+    end
+  end
+  if vim.api.nvim_buf_is_valid(buf) then
+    pcall(vim.api.nvim_buf_delete, buf, { force = true })
+  end
 end
 
 function M.pick_context_files()
@@ -286,6 +326,15 @@ function M.add_current_buffer(max_bytes)
   else
     print("llm.nvim: added context file " .. vim.fn.fnamemodify(path, ":."))
   end
+end
+
+function M.showCurrentModels(opts)
+  local ok, llm = pcall(require, "llm")
+  if not ok or not llm.show_current_models then
+    print("llm.nvim: unable to display current models")
+    return
+  end
+  return llm.show_current_models(opts)
 end
 
 return M

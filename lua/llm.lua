@@ -6,8 +6,12 @@ local M = {}
 
 local timeout_ms = 5000
 local log_level = vim.log.levels.INFO
-local sign_defined = false
+local sign_defined = {}
 local spinner_frames = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+local category_spinner_frames = {
+        coding = { "◰", "◳", "◲", "◱" },
+}
+local category_reasoning_defaults = {}
 local spinner_interval = 100
 local progress_sign = {
         text = ">>",
@@ -150,40 +154,76 @@ local current_responses = {}
 -- Namespace for extmarks used when streaming results
 local ns = vim.api.nvim_create_namespace("llm")
 
-local function ensure_progress_signs()
-        if sign_defined then
+local spinner_key_ids = {}
+local spinner_set_counter = 0
+
+local function spinner_set_id(frames)
+        local key = table.concat(frames, "|")
+        if spinner_key_ids[key] then
+                return spinner_key_ids[key]
+        end
+        spinner_set_counter = spinner_set_counter + 1
+        local id = spinner_set_counter
+        spinner_key_ids[key] = id
+        return id
+end
+
+-- Apply per-category reasoning defaults / overrides to a service
+local function apply_category_reasoning(svc, category)
+        if not svc then
                 return
         end
-        for i, ch in ipairs(spinner_frames) do
-                pcall(vim.fn.sign_define, "llm_progress_" .. i, {
+        svc.stream_params = svc.stream_params or {}
+        local per_cat = svc.reasoning_per_category or {}
+        local default_effort
+        if category_reasoning_defaults and category_reasoning_defaults[category] ~= nil then
+                default_effort = category_reasoning_defaults[category]
+        end
+        local effort = per_cat[category]
+        if effort == nil then
+                effort = default_effort
+        end
+        svc.stream_params.reasoning_effort = effort
+end
+
+local function ensure_progress_signs(frames)
+        local id = spinner_set_id(frames)
+        if sign_defined[id] then
+                return id
+        end
+        for i, ch in ipairs(frames) do
+                pcall(vim.fn.sign_define, "llm_progress_" .. id .. "_" .. i, {
                         text = ch,
                         texthl = progress_sign.texthl,
                         numhl = progress_sign.numhl,
                 })
         end
-        sign_defined = true
+        sign_defined[id] = true
+        return id
 end
 
 local function update_progress_sign(ctx, frame)
         if not ctx.sign_id or ctx.stopped then
                 return
         end
-        ensure_progress_signs()
+        local frames = ctx.spinner_frames or spinner_frames
+        local set_id = ctx.spinner_set_id or ensure_progress_signs(frames)
         local pos = vim.api.nvim_buf_get_extmark_by_id(ctx.buf, ns, ctx.mark, {})
         if not pos or #pos == 0 then
                 return
         end
         local lnum = pos[1] + 1
-        local name = "llm_progress_" .. frame
+        local name = "llm_progress_" .. set_id .. "_" .. frame
         pcall(vim.fn.sign_unplace, "llm", { buffer = ctx.buf, id = ctx.sign_id })
         pcall(vim.fn.sign_place, ctx.sign_id, "llm", name, ctx.buf, { lnum = lnum, priority = 15 })
 end
 
 local function place_progress_sign(ctx)
-        ensure_progress_signs()
+        local frames = ctx.spinner_frames or spinner_frames
+        local set_id = ensure_progress_signs(frames)
         local pos = vim.api.nvim_buf_get_extmark_by_id(ctx.buf, ns, ctx.mark, {})
         local lnum = pos and pos[1] and (pos[1] + 1) or (vim.api.nvim_win_get_cursor(0)[1])
-        local ok, id = pcall(vim.fn.sign_place, 0, "llm", "llm_progress_1", ctx.buf, {
+        local ok, id = pcall(vim.fn.sign_place, 0, "llm", "llm_progress_" .. set_id .. "_1", ctx.buf, {
                 lnum = lnum,
                 priority = 15,
         })
@@ -191,6 +231,9 @@ local function place_progress_sign(ctx)
                 log("debug", "failed to place progress sign: " .. tostring(id))
                 return nil, nil
         end
+
+        ctx.spinner_set_id = set_id
+        ctx.spinner_frames = frames
 
         local frame = 1
         local timer = vim.loop.new_timer()
@@ -202,7 +245,7 @@ local function place_progress_sign(ctx)
                                 if ctx.stopped then
                                         return
                                 end
-                                frame = frame % #spinner_frames + 1
+                                frame = frame % #frames + 1
                                 update_progress_sign(ctx, frame)
                         end)
                 )
@@ -319,18 +362,6 @@ local anthropic_adapter = {
 }
 
 local service_lookup = {
-        groq = {
-                url = "https://api.groq.com/openai/v1/chat/completions",
-                model = "llama3-70b-8192",
-                api_key_name = "GROQ_API_KEY",
-                adapter = default_openai_adapter,
-        },
-        openai = {
-                url = "https://api.openai.com/v1/chat/completions",
-                model = "gpt-4o",
-                api_key_name = "OPENAI_API_KEY",
-                adapter = default_openai_adapter,
-        },
         openrouter = {
                 url = "https://openrouter.ai/api/v1/chat/completions",
                 model = "gpt-4o-mini",
@@ -338,19 +369,14 @@ local service_lookup = {
                 adapter = default_openai_adapter,
                 trim_thinking = true,
                 stream_params = {},
+                reasoning_per_category = {},
                 models = {
                         coding = "gpt-4o-mini",
                         thinking = "anthropic/claude-3.5-sonnet",
                         util = "qwen/qwen-2.5-7b",
                 },
                 category = "coding",
-        },
-        anthropic = {
-                url = "https://api.anthropic.com/v1/messages",
-                model = "claude-3-5-sonnet-20240620",
-                api_key_name = "ANTHROPIC_API_KEY",
-                adapter = anthropic_adapter,
-        },
+        }
 }
 
 local function get_api_key(name)
@@ -377,11 +403,24 @@ function M.setup(opts)
         end
         if opts.progress_sign then
                 progress_sign = vim.tbl_extend("force", progress_sign, opts.progress_sign)
-                sign_defined = false -- force re-define with new icon
+                sign_defined = {}
+                spinner_key_ids = {}
+                spinner_set_counter = 0
         end
         if opts.spinner_frames and vim.islist(opts.spinner_frames) and #opts.spinner_frames > 0 then
                 spinner_frames = opts.spinner_frames
-                sign_defined = false
+                sign_defined = {}
+                spinner_key_ids = {}
+                spinner_set_counter = 0
+        end
+        if opts.category_spinner_frames and type(opts.category_spinner_frames) == "table" then
+                category_spinner_frames = opts.category_spinner_frames
+                sign_defined = {}
+                spinner_key_ids = {}
+                spinner_set_counter = 0
+        end
+        if opts.category_reasoning_defaults and type(opts.category_reasoning_defaults) == "table" then
+                category_reasoning_defaults = opts.category_reasoning_defaults
         end
         if opts.spinner_interval then
                 spinner_interval = opts.spinner_interval
@@ -410,18 +449,13 @@ function M.setup(opts)
                 if last.stream_params then
                         svc.stream_params = last.stream_params
                 end
+                if last.service == "openrouter" then
+                        apply_category_reasoning(svc, svc.category or "coding")
+                end
                 -- ignore stored headers to avoid sending optional OpenRouter headers by default
                 if last.data_collection ~= nil then
                         svc.data_collection = last.data_collection
                 end
-                log(
-                        "info",
-                        string.format(
-                                "restored last model '%s' for service '%s'",
-                                tostring(last.model),
-                                tostring(last.service)
-                        )
-                )
         end
 end
 
@@ -591,8 +625,7 @@ local function pick_openrouter_thinking()
                                                 trim_thinking = service.trim_thinking,
                                                 stream_params = service.stream_params,
                                         })
-                                        local label = selection.value and "show" or "hide"
-                                        print("llm.nvim: OpenRouter thinking tokens set to " .. label)
+                                        -- quiet: avoid hit-enter prompts
                                 end
 
                                 actions.select_default:replace(set_mode)
@@ -612,15 +645,19 @@ local function set_category(service_name, category)
         if svc.models and svc.models[category] then
                 svc.model = svc.models[category]
         end
+        if service_name == "openrouter" then
+                apply_category_reasoning(svc, category)
+        end
         store.save_last(service_name, {
                 model = svc.model,
                 category = svc.category,
                 trim_thinking = svc.trim_thinking,
                 stream_params = svc.stream_params,
         })
-        print(
+        log(
+                "info",
                 string.format(
-                        "llm.nvim: %s category set to %s (%s)",
+                        "%s category set to %s (%s)",
                         service_name,
                         category,
                         tostring(svc.model)
@@ -683,10 +720,10 @@ local function pick_openrouter_category()
                 :find()
 end
 
-local function pick_openrouter_thinking_effort()
+local function pick_openrouter_coding_effort()
         local ok = pcall(require, "telescope")
         if not ok then
-                print("llm.nvim: telescope.nvim is required for thinking effort selection")
+                print("llm.nvim: telescope.nvim is required for coding effort selection")
                 return
         end
 
@@ -696,10 +733,10 @@ local function pick_openrouter_thinking_effort()
         end
 
         local entries = {
-                { value = "low", display = "Low reasoning effort (faster/cheaper)" },
-                { value = "medium", display = "Medium reasoning effort (default)" },
-                { value = "high", display = "High reasoning effort (more tokens/slower)" },
-                { value = vim.NIL, display = "Unset (model default)" },
+                { value = "low", display = "Coding: Low reasoning effort (fast/cheap)" },
+                { value = "medium", display = "Coding: Medium reasoning effort" },
+                { value = "high", display = "Coding: High reasoning effort" },
+                { value = vim.NIL, display = "Coding: Unset (model default)" },
         }
 
         local pickers = require("telescope.pickers")
@@ -729,21 +766,19 @@ local function pick_openrouter_thinking_effort()
                                         if not selection then
                                                 return
                                         end
-                                        service.stream_params = service.stream_params or {}
-                                        if selection.value == vim.NIL then
-                                                service.stream_params.reasoning_effort = nil
-                                        else
-                                                service.stream_params.reasoning_effort = selection.value
+                                        service.reasoning_per_category = service.reasoning_per_category or {}
+                                        local val = selection.value
+                                        if val == vim.NIL then
+                                                val = nil
                                         end
+                                        service.reasoning_per_category.coding = val
+                                        apply_category_reasoning(service, "coding")
                                         store.save_last("openrouter", {
                                                 model = service.model,
                                                 trim_thinking = service.trim_thinking,
                                                 stream_params = service.stream_params,
                                         })
-                                        print(
-                                                "llm.nvim: OpenRouter reasoning_effort set to "
-                                                        .. tostring(selection.value or "default")
-                                        )
+                                        -- keep quiet to avoid hit-enter prompts
                                 end
 
                                 actions.select_default:replace(set_mode)
@@ -1105,7 +1140,7 @@ function M.prompt(opts)
 
         local has_api_key = api_key_name and get_api_key(api_key_name) ~= nil
         log(
-                "info",
+                "debug",
                 string.format(
                         "sending request to %s with model %s (timeout=%dms, trim_thinking=%s, api_key=%s)",
                         service,
@@ -1196,9 +1231,17 @@ function M.prompt(opts)
         -- insert a new line where output will be written
         vim.api.nvim_buf_set_lines(buf, row, row, true, { "" })
         local mark = vim.api.nvim_buf_set_extmark(buf, ns, row, 0, {})
+        local frames = spinner_frames
+        if found_service and found_service.category and category_spinner_frames then
+                local cat_frames = category_spinner_frames[found_service.category]
+                if vim.islist(cat_frames) and #cat_frames > 0 then
+                        frames = cat_frames
+                end
+        end
         local ctx = {
                 buf = buf,
                 mark = mark,
+                spinner_frames = frames,
         }
         local sign_id, spinner_timer = place_progress_sign(ctx)
 
@@ -1467,6 +1510,82 @@ function M.token_count()
         return total
 end
 
+local function collect_service_status()
+        local list = {}
+        for name, svc in pairs(service_lookup) do
+                table.insert(list, {
+                        service = name,
+                        model = svc.model,
+                        category = svc.category,
+                        trim_thinking = svc.trim_thinking,
+                        stream_params = svc.stream_params,
+                        data_collection = svc.data_collection,
+                        models = svc.models,
+                        reasoning_per_category = svc.reasoning_per_category,
+                })
+        end
+        table.sort(list, function(a, b)
+                return a.service < b.service
+        end)
+        return list
+end
+
+function M.show_current_models(opts)
+        opts = opts or {}
+        local lines = {}
+        for _, s in ipairs(collect_service_status()) do
+                table.insert(lines, s.service .. ":")
+                table.insert(lines, "  current: " .. (s.model or "<unset>"))
+                if s.category then
+                        table.insert(lines, "  category: " .. s.category)
+                end
+                if s.models and type(s.models) == "table" then
+                        local cats = {}
+                        for cat, mdl in pairs(s.models) do
+                                table.insert(cats, cat)
+                        end
+                        table.sort(cats)
+                        for _, cat in ipairs(cats) do
+                                local mdl = s.models[cat]
+                                table.insert(lines, string.format("    %s model: %s", cat, mdl or "<unset>"))
+                        end
+                end
+                if s.stream_params then
+                        local effort = s.stream_params.reasoning_effort
+                        table.insert(lines, "  reasoning (active): " .. tostring(effort or "default"))
+                end
+                if s.reasoning_per_category and type(s.reasoning_per_category) == "table" then
+                        local cats = {}
+                        for cat, _ in pairs(s.reasoning_per_category) do
+                                table.insert(cats, cat)
+                        end
+                        table.sort(cats)
+                        for _, cat in ipairs(cats) do
+                                local eff = s.reasoning_per_category[cat]
+                                table.insert(lines, string.format("    reasoning[%s]: %s", cat, tostring(eff or "default")))
+                        end
+                end
+                if s.trim_thinking ~= nil then
+                        table.insert(lines, "  trim_thinking: " .. tostring(s.trim_thinking))
+                end
+                if s.data_collection ~= nil then
+                        table.insert(lines, "  data_collection: " .. tostring(s.data_collection))
+                end
+                table.insert(lines, "") -- blank line between services
+        end
+        if not opts.quiet then
+                local message = table.concat(lines, "\n")
+                if vim and vim.notify then
+                        vim.notify(message, vim.log.levels.INFO, { title = "llm.nvim models" })
+                else
+                        print(message)
+                end
+        end
+        return lines
+end
+
+M.get_service_status = collect_service_status
+
 vim.api.nvim_create_user_command("LLMTokenCount", function()
         M.token_count()
 end, {})
@@ -1486,12 +1605,15 @@ end
 
 M.pick_openrouter_model = pick_openrouter_model
 M.pick_openrouter_thinking = pick_openrouter_thinking
-M.pick_openrouter_thinking_effort = pick_openrouter_thinking_effort
+-- selector now targets coding category reasoning effort for quick toggles
+M.pick_openrouter_thinking_effort = pick_openrouter_coding_effort
+M.pick_openrouter_coding_effort = pick_openrouter_coding_effort
 M.pick_openrouter_category = pick_openrouter_category
 M.set_category = set_category
 M.add_context_path = ctxmod.add_context_path
 M.add_current_context_file = ctxmod.add_current_buffer
 M.open_context_buffer = ctxmod.open_context_buffer
+M.close_context_buffer = ctxmod.close_context_buffer
 M.pick_context_files = ctxmod.pick_context_files
 M.get_extra_context_string = ctxmod.get_extra_context_string
 
